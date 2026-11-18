@@ -1,0 +1,7 @@
+---
+base: lua53
+globals:
+  mpc:
+    any: true
+  LaunchControlXL3:
+    any: true

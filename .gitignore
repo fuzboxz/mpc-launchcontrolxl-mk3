@@ -1,0 +1,17 @@
+# Non-committed references (downloaded PDFs, decompiled scripts, extracted binaries)
+references/*
+!references/README.md
+work/
+*.img
+*.bin
+*.pdf
+*.txt
+!docs/*.txt
+# Build outputs
+build/
+*.ini
+!script/*.ini.in
+# Release zips
+*.zip
+# Development artifacts (local paths)
+dev/

@@ -1,0 +1,8 @@
+[info]
+device=Launch Control XL 3
+manufacturer=Novation
+input=LCXL3 1 DAW In,MIDIIN2 (LCXL3 1)
+output=LCXL3 1 DAW In,MIDIOUT2 (LCXL3 1)
+script=LaunchControlXL3.lua
+scriptVersion=1.0
+checksum=PLACEHOLDER
