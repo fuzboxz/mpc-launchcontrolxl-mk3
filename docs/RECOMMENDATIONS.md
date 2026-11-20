@@ -99,10 +99,10 @@ Phase-1 rows are marked ✅. Everything else is the proposal.
 | Faders 1-8 | track volume (bank) | position sync + screen | ✅ |
 | Play / Record | transport | play/record LEDs | ✅ |
 | Shift+Play / Record | stop / overdub | — | ✅ |
-| Track ◀▶ | bank ±1 (Shift ±8) | edge LEDs | ✅ |
+| Track ◀▶ | bank ±1 (Shift ±8) — *superseded 2026-11 by the shipped mapping: Track moves the visible 8-track window by ONE track per press, no Shift ±8, selection never moves* | edge LEDs | ✅ |
 | Page ▲▼ | mode page | overlay | ✅ |
 | Novation | status (Shift: probe) | white | ✅ |
-| **Shift+Track ◀▶** | **select prev/next track** (`currentTrack.Previous/Next`) | repaint | 2 |
+| **Shift+Track ◀▶** | **select prev/next track** (`currentTrack.Previous/Next`) — *superseded 2026-11 by the shipped mapping: Shift+Track = undo/redo* | repaint | 2 |
 | **Shift+Novation (hold 1 s)** | **save** (`controlSurface.save`) | — | 2 |
 | **Shift+Page ▲▼ (hold 1 s)** | **undo / redo** (`commandManager`) | — | 2 |
 | **Record (double press)** | count-in record (`SetCountInEnable` + `Record`) | blink red | 3 |
@@ -131,6 +131,10 @@ so the user always knows which layer is live.
 
 Later: a **master page** (Shift+Page ▲▼ long-press) mapping row 3 to master sends /
 cue / crossfader — the `masterTracks[0]` surface exists **[p0]**.
+
+> 2026-11 device findings: **not the fader path as assumed** — `masterTracks[0].Volume`
+> writes do not move the MPC's MAIN fader; probe pending
+> (`reports/00-FINAL-TRIAGE.md` §5).
 
 ### 4.4 Encoders — DAW Control
 
@@ -193,7 +197,8 @@ One colour per *meaning*, never per button:
 | arm (row mode) | red 5 / dim 7 |
 | mute | orange 96 / dim 83 |
 | selection | white 3 / dim 1 |
-| sends | blue 41, dark blue 47, turquoise 39, green 21 (Send 1-4) |
+| sends | blue 41, purple 53, turquoise 39, green 21 (Send 1-4, track page) |
+| track-page volume trim | orange 96 |
 | pan position | blue L / dim white C / orange R |
 | Q-Link rows | turquoise 39 (row 1), purple 53 (row 2) |
 | global params | orange = tempo, yellow = swing/loop, white = rest, green = metronome |

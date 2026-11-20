@@ -18,10 +18,11 @@ end
 L.OnLoad()
 
 -- Initial mixer paint: rows 1/2 = track colour (green) scaled by the send
--- level (0 -> subtle 7% tint), row 3 dark at pan centre.
+-- level (0 -> subtle 7% tint), row 3 visible white at pan centre (distinct
+-- from the L/R hues; device feedback 2026-11).
 assert_eq(mock.leds[13], "0,9,0", "row 1 = track colour at send level 0")
 assert_eq(mock.leds[21], "0,9,0", "row 2 = track colour at send level 0")
-assert_eq(mock.leds[29], "0,0,0", "row 3 encoder LED dark at pan centre")
+assert_eq(mock.leds[29], "44,44,44", "row 3 white at pan centre")
 
 -- Raising the send level brightens the ring toward the full track colour.
 mock.tracks[0].Send1:set(1.0)
@@ -53,22 +54,22 @@ mock.tracks[2].Pan:set(0.5)
 -- Steep curve: small offsets start near-black, extremes reach full base.
 mock.tracks[0].Pan:set(0.55)
 L.HandleTimer()
-assert_eq(mock.leds[29], "3,1,0", "pan 0.55 = almost black")
+assert_eq(mock.leds[29], "18,8,0", "pan 0.55 = dim orange fading in from the white centre")
 mock.tracks[0].Pan:set(0.6)
 L.HandleTimer()
-assert_eq(mock.leds[29], "9,4,0", "pan 0.6 = very dim orange")
+assert_eq(mock.leds[29], "23,11,0", "pan 0.6 = dim orange")
 mock.tracks[0].Pan:set(0.9)
 L.HandleTimer()
-assert_eq(mock.leds[29], "93,44,0", "pan 0.9 = bright orange")
+assert_eq(mock.leds[29], "97,46,0", "pan 0.9 = bright orange")
 mock.tracks[0].Pan:set(1.0)
 L.HandleTimer()
 assert_eq(mock.leds[29], "127,60,0", "pan hard right = full base")
 mock.tracks[0].Pan:set(0.1)
 L.HandleTimer()
-assert_eq(mock.leds[29], "18,53,93", "pan 0.1 = mirrored blue")
+assert_eq(mock.leds[29], "18,55,97", "pan 0.1 = mirrored blue")
 mock.tracks[0].Pan:set(0.5)
 L.HandleTimer()
-assert_eq(mock.leds[29], "0,0,0", "centred pan ring dark")
+assert_eq(mock.leds[29], "44,44,44", "centred pan ring white")
 
 -- Send bank B keeps the track colours, still scaled by its own send levels.
 L.HandleMIDICC(0, 106, 127) -- page up -> send bank B
@@ -88,20 +89,30 @@ L.HandleMIDICC(6, 30, 2)
 L.HandleTimer()
 assert_eq(mock.leds[13], "0,0,0", "unassigned Q-Link 1 dark")
 assert_eq(mock.leds[20] == nil or mock.leds[20] == "0,0,0", true, "unassigned Q-Link 8 dark (nil = already off, cache-skipped)")
-mock.setQlinkTarget(0, "Cutoff")
-mock.setQlinkTarget(8, "Resonance")
-mock.qlinkPositions[0] = 127 -- Q-Link 1 at 100%: full turquoise
-mock.qlinkPositions[8] = 64 -- Q-Link 9 mid: scaled purple
+-- fw 1.1.11 also reports unassigned as an EMPTY STRING name: still dark
+for i = 0, 15 do
+	mock.setQlinkTarget(i, "")
+end
+mock.tracks[0].Solo:set(false)
+L.HandleTimer()
+assert_eq(mock.leds[13], "0,0,0", "empty-string Q-Link 1 dark too")
+for i = 0, 15 do
+	mock.setQlinkTarget(i, false)
+end
+mock.setQlinkTarget(12, "Cutoff") -- row 1 col 1 = index 12 (MPC screen order)
+mock.setQlinkTarget(14, "Resonance") -- row 2 col 1 = group 3 top (index 14)
+mock.qlinkPositions[12] = 127 -- full turquoise
+mock.qlinkPositions[14] = 64 -- scaled purple
 mock.tracks[0].Solo:set(false) -- any state change marks a repaint
 L.HandleTimer()
 assert_eq(mock.leds[13], "0,108,108", "assigned Q-Link row 1 full at value 1")
 assert_eq(mock.leds[21], "42,6,42", "assigned Q-Link row 2 scaled at value ~0.5")
-mock.qlinkPositions[0] = 0
+mock.qlinkPositions[12] = 0
 mock.tracks[0].Solo:set(true) -- force a repaint
 L.HandleTimer()
 assert_eq(mock.leds[13], "0,8,8", "Q-Link row 1 subtle tint at value 0")
 mock.tracks[0].Solo:set(false)
-mock.qlinkPositions[0] = 64
+mock.qlinkPositions[12] = 64
 mock.qlinkPositions[8] = 64
 
 -- Unload: every surface LED goes dark.

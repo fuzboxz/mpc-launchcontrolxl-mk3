@@ -49,6 +49,12 @@ marked **[p0]** (Phase-0 probe).
   `GetTrackRecordArmed`, `GetTrackInputPort`, …) — they error in every argument form.
   **[dv]**
 
+> **Hardware findings 2026-11** (probe pending): the **[p0]** above did not survive
+> first contact — `masterTracks[0].Volume` is **not** the master fader path as assumed
+> (device-disproven on an MPC Live III, fw 1.1.11; the empty-table dump reading was an
+> empty-project artifact). The **[p0]** stays unflipped until the master-surface probe
+> runs. Probe list: `reports/00-FINAL-TRIAGE.md` §5.
+
 ## 3. Transport & tempo
 
 - `sequencer.Play/Stop/TogglePlay/Record/RecordOff/Overdub`; props `Playing`,
@@ -71,6 +77,13 @@ marked **[p0]** (Phase-0 probe).
   (only script-emitted MIDI does not loop back). **[dv]**
 - `mpc.controlSurface.qlink.Selected` / a `LastTouchedQlink` helper do **not** exist in
   the dump — the stationary screen's focus line degrades to `-`.
+
+> **Hardware findings 2026-11** (probe pending): both probed argument orders for
+> `AddInfiniteCCToQLink` are wrong on device — the true order is inferred as
+> `(qlink, cc, channel)` [H4, uniquely fits the observed mis-binding], and the MPC
+> parser's sign is inverted vs the XL3 binary offset (direction device-proven,
+> magnitude open). The script therefore ships native routing **disabled** (script-side
+> `Twist` for all 16). Probe list: `reports/00-FINAL-TRIAGE.md` §5.
 
 ## 5. Virtual MPC buttons
 

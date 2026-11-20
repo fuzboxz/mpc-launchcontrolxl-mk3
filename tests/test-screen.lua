@@ -27,8 +27,9 @@ end
 L.OnLoad()
 
 -- The stationary display is 3-line: range, current track, current target.
--- (the fader track map queues first; a few ticks drain the pump budget)
-for _ = 1, 6 do
+-- (the fader track map queues first; the pump sends 2 texts per tick, so the
+-- initial load map plus its one-shot re-asserts need ~28 ticks to drain)
+for _ = 1, 40 do
 	L.HandleTimer()
 end
 local static = texts(53, 0)
@@ -38,7 +39,7 @@ assert_eq(trackLine[#trackLine], "Track 0", "stationary line 2 shows the current
 
 -- A bank move repaints the stationary line 1 and announces it on the overlay.
 L.HandleMIDICC(0, 102, 127)
-for _ = 1, 10 do
+for _ = 1, 40 do
 	L.HandleTimer()
 end
 local static2 = texts(53, 0)
@@ -50,7 +51,7 @@ assert_eq(overlay[#overlay], "tracks 2-9", "overlay announces the bank move")
 L.HandleMIDICC(0, 103, 127) -- back to bank 0 so track 0 is visible again
 mock.tracks[0].Name:set("Tr\xffack\xf0 with a very long name")
 L.HandleMIDICC(15, 77, 65) -- turn the Send 1 encoder for track 0
-for _ = 1, 10 do
+for _ = 1, 40 do
 	L.HandleTimer()
 end
 local sawSanitised = false
@@ -73,12 +74,14 @@ L.HandleTimer()
 local ov = texts(54, 0)
 assert_eq(ov[#ov], "DAW Control", "mode change announced on the overlay")
 local ov2 = texts(54, 1)
-assert_eq(ov2[#ov2], "Q-Links 1-16", "overlay line 2 shows the routing")
+assert_eq(ov2[#ov2], "Q-Links (script)", "overlay line 2 shows the routing (native routing disabled by default)")
 
 -- Control mode stationary line 3 shows the focused Q-Link target.
 mock.setQlinkTarget(0, "Cutoff")
 L.HandleMIDICC(15, 93, 65) -- tempo encoder: marks the surface dirty
-L.HandleTimer()
+for _ = 1, 6 do
+	L.HandleTimer()
+end
 local line3 = texts(53, 2)
 assert_eq(line3[#line3], "-", "stationary line 3 falls back to '-' without a focus API")
 

@@ -68,7 +68,7 @@ script does for clip states.
 
 ## 10. Degrade the screen last
 
-When the sysex budget is tight, drop per-control refreshes first, the overlay second,
-and the stationary line last — a stale title is less harmful than a stale value. The
-timer's `refreshLastTouched` (every 500 ms) is the only periodic text source; nothing
-else polls.
+When the sysex budget is tight, drop the overlay first, then per-control refreshes,
+and the stationary line last (design doc wins — RECOMMENDATIONS §7.2; a stale toast
+is the cheapest loss). The timer's `refreshLastTouched` (every 500 ms) is the only
+periodic text source; nothing else polls.

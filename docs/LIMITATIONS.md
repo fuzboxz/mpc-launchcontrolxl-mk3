@@ -44,6 +44,16 @@ Hard walls are marked with their source; script-specific limits are **[script]**
 | **No bitmap art** | the 1216-byte bitmap path is documented but unused |
 | **Single device** | device IDs 2-8 are not auto-detected; the port name in the `.ini` picks the unit |
 
+## Current limitations (device findings 2026-11, probe pending)
+
+| Limit | Consequence |
+|---|---|
+| Native Q-Link routing disabled by default | XL3 fw 1.1.11 inverts the MPC infinite-CC direction vs the XL3 binary offset, so all 16 Q-Links are driven script-side (`Touch` + `Twist`; row 1 via the absolute→delta path) until the direction/magnitude probe runs (`reports/00-FINAL-TRIAGE.md` §5) |
+| fw 1.1.11 Q-Link writes | the method-form `q:Twist(delta)` corrupts the Q-Link page (targets vanish after a few calls; app restart restores). Only dot-form `H.call(q.Twist, d)` / `SetValue` / `SetPosition` are safe, per the LPP3-proven driver |
+| fw 1.1.11 read-back lag | `GetPosition()`/`GetValueString()` lag one change - never verify a write synchronously |
+| Master volume slot pending hardware probe | `masterTracks[0].Volume` is device-disproven as the master fader path; row-3 col 8 writes only over a real read (one-shot failure log, no blind default) and may do nothing until the master-surface probe runs |
+| Row-1 encoders emit absolute CCs on fw 1.1.11 | the row-1 relative enable (CC 69) is dead; absolute values are converted to deltas (first sighting absorbed as the baseline) so nothing jumps |
+
 ## Degrade behaviour (implemented)
 
 - Missing `mappings.controlSurface.qlinks` → Q-Link rows fall back to script `Twist`.

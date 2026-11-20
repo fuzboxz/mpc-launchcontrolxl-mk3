@@ -43,6 +43,18 @@ never commit Akai binaries. `tools/verify_salt.py` / `tools/test-sign.sh` re-val
 the rule against Akai's shipped `mpkMiniMkIV` pairs when `XZT_DIR` points at your
 extracted kit.
 
+## Lua host limits
+
+The MPC Lua host is Lua 5.4 and a chunk may hold at most **200 active locals**.
+This script sits at the ceiling: adding one more top-level `local` makes
+`luac5.4 -p` fail with "too many local variables" (the suite and the build both
+stop at that gate). Mitigations already in use: state that would otherwise be
+a local is kept on a `__LCXL3_*` global (e.g. `__LCXL3_IMMEDIATE`,
+`__LCXL3_QDIRTY`, `__LCXL3_SWING`, `__LCXL3_SCRETRIES`), and bulk top-level
+loop code is wrapped in a builder function (`buildSurfaceCC`) so the for-loop
+locals live in a function scope. When adding features, prefer table fields on
+existing tables or globals over new top-level locals.
+
 ## Conventions
 
 - Lua 5.4, tabs, 100-col soft wrap; `selene` with `std = "lua53+mpc"` (`mpc.yml`

@@ -15,3 +15,6 @@ build/
 *.zip
 # Development artifacts (local paths)
 dev/
+
+# Session scaffolding (reports/*.md ship; the orchestration scripts do not)
+reports/workflow-*.js

@@ -25,7 +25,8 @@ L.OnLoad()
 mock.dev.mappings.controlSurface = nil
 L.HandleMIDICC(6, 30, 2)
 L.HandleMIDICC(15, 77, 66)
-assert_eq(mock.count("Twist"), 1, "Twist fallback without the mapping API")
+L.HandleTimer()
+assert_eq(mock.count("Twist"), 1, "Twist fallback without the mapping API (dot-form, timer-drained)")
 L.HandleMIDICC(6, 30, 1)
 
 -- 2. No qlinks object: the Q-Link rows go dark and inert; transport survives.
@@ -33,7 +34,8 @@ local savedCS = mock.mpc.controlSurface
 mock.mpc.controlSurface = nil
 L.HandleMIDICC(6, 30, 2)
 L.HandleMIDICC(15, 77, 66)
-assert_eq(mock.count("Twist"), 1, "no Q-Link writes without mpc.controlSurface")
+L.HandleTimer()
+assert_eq(mock.count("Twist"), 1, "no NEW Q-Link writes without mpc.controlSurface (cumulative)")
 L.HandleMIDICC(0, 116, 127)
 assert_eq(mock.count("TogglePlay") >= 1, true, "transport still works")
 L.HandleMIDICC(6, 30, 1)

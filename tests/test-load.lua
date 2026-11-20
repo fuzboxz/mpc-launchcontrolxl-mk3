@@ -61,8 +61,11 @@ assert_eq(sentCC(6, 111, 100), true, "LED brightness set")
 assert_eq(sentCC(6, 112, 100), true, "screen brightness set")
 assert_eq(sentCC(6, 121, 1), true, "encoder curve medium")
 
--- Mode request: the script selects DAW Mixer (value 1) on ch 7 CC 30.
-assert_eq(sentCC(6, 30, 1), true, "surface mode requested")
+-- Mode: the script no longer FORCES mixer (an acvs re-init while the surface
+-- is in the DAW template must not be stomped); it queries instead (ch 8) and
+-- the device's reply adopts the real mode. The query rides CH_QUERY (ch 8,
+-- 0-based 7) CC 30 with the mixer payload as the handshake.
+assert_eq(sentCC(7, 30, 1), true, "surface mode QUERY sent (no forced request)")
 
 -- Input registration covers every channel the surface speaks on.
 local function registered(ch, cc)

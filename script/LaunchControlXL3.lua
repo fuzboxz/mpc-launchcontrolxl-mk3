@@ -80,6 +80,29 @@ local DAW_NOTE = 12 -- note on CH_ANALOG whose velocity toggles DAW mode
 local MODE_MIXER = 1
 local MODE_CONTROL = 2
 
+-- Q-Link native routing (mapQlinks): fw 1.1.11 device evidence - MPC's infinite-CC
+-- parser sign is inverted vs the XL3 binary offset (CW moves parameters CCW), so
+-- native routing ships OFF; all 16 Q-Links are driven script-side (Twist fallback:
+-- rel row 2 direct, abs-only row 1 via the P0-2 abs-delta path). Re-enable only
+-- after the direction/magnitude probe (reports/00-FINAL-TRIAGE.md section 5 probe 10).
+-- Q-Link knob order (device-confirmed on the user's MPC 3.10.1, 2026-11-20,
+-- once the abs-path/screen fixes made row 1 observable): the Q-Link screen
+-- lists the 16 slots as four groups read top-to-bottom -- group 1 is Q-Links
+-- 13,9,5,1 (indices 12,8,4,0), group 2 is 14,10,6,2, group 3 is 15,11,7,3,
+-- group 4 is 16,12,8,4 -- the column-major page groups LPP3/LPMK3 verified.
+-- The XL3 mirrors the groups in order: knob row 1 = groups 1+2, row 2 =
+-- groups 3+4, each group's four slots read left-to-right on the knob row.
+local QLINK_ORDER = { 12, 8, 4, 0, 13, 9, 5, 1, 14, 10, 6, 2, 15, 11, 7, 3 }
+
+-- diagnostic build: bounded turn tracing (global to dodge the 200-local cap)
+
+local function qlinkIndexOfKnob(row, col)
+	local p = row * 8 + col
+	return QLINK_ORDER[p + 1] or p
+end
+
+local QLINK_NATIVE_ROUTING = false
+
 -- Novation 128-colour palette indices used by this script (Launch family palette;
 -- indices confirmed by Ableton's Launch_Control_XL_3 skin).
 -- LED colours as custom RGB (sysex op 01 53h, components 0-127). The DAW-mode
@@ -125,7 +148,7 @@ local ACTIONS = {
 	{ group = "Encoders, mixer mode (MIDI ch 16)", cc = ENC0, ch = 16, label = "Row 1", plain = "Send 1 (bank A) / Send 3 (bank B)", shift = "preview on screen" },
 	{ group = "Encoders, mixer mode (MIDI ch 16)", cc = ENC0 + 8, ch = 16, label = "Row 2", plain = "Send 2 (bank A) / Send 4 (bank B)", shift = "preview on screen" },
 	{ group = "Encoders, mixer mode (MIDI ch 16)", cc = ENC0 + 16, ch = 16, label = "Row 3", plain = "Pan", shift = "preview on screen" },
-	{ group = "Encoders, control mode (MIDI ch 16)", cc = ENC0, ch = 16, label = "Rows 1-2", plain = "MPC Q-Links 0-15 (hardware-routed)", shift = "preview on screen" },
+	{ group = "Encoders, control mode (MIDI ch 16)", cc = ENC0, ch = 16, label = "Rows 1-2", plain = "MPC Q-Links 0-15 (script-driven; native routing pending hardware probe)", shift = "preview on screen" },
 	{ group = "Encoders, control mode (MIDI ch 16)", cc = ENC0 + 16, ch = 16, label = "Row 3 (global page)", plain = "tempo, swing, quantize strength, quantize division, metronome, loop, automation filter, master volume", shift = "preview on screen" },
 	{ group = "Encoders, control mode (MIDI ch 16)", cc = ENC0 + 16, ch = 16, label = "Row 3 (track page)", plain = "pan, Send 1-4, volume trim of the selected track", shift = "preview on screen" },
 	{ group = "Feature buttons (MIDI ch 7)", cc = FEAT.shift, ch = 7, label = "Shift", plain = "hold for the shift functions (double press latches)", shift = "-" },
@@ -156,12 +179,14 @@ local probeMode = false
 local qlinkRouted = false -- rows 1/2 hardware-routed into MPC Q-Links
 local qlinkFallback = false -- routing missing: the script emulates with Twist
 local ticks = 0
-local blinkOn = false
 local repaintDirty = true
 local lastLog = {}
 local ledCache = {} -- control index -> last palette index sent
-local screenSent = {} -- "target:field" -> last text sent
-local screenQueue = {} -- closures, pumped a few per timer tick
+local screenSent = {} -- "target:field" -> last text committed at SEND time
+local screenQueue = {} -- tagged records ({kind="text",key,target,field,text} / {kind="raw",fn}), pumped a few per timer tick
+local screenReassert = {} -- set of keys to force-queue once on a quiet tick after a multi-text burst
+__LCXL3_SCRETRIES = {} -- re-assert attempts per key per burst (max 2; global: local budget)
+local lastAbs = {} -- [row*8+col] -> last absolute encoder value seen (abs converted to deltas)
 local faderArmed = {} -- col -> software pickup pending
 local faderRef = {} -- col -> last position the MPC had (0-127)
 local faderLast = {} -- col -> last incoming position
@@ -248,6 +273,21 @@ function H.member(obj, key, kind)
 	return nil
 end
 
+-- obj[key] when readable, else nil. Sol2 userdata can throw on missing
+-- members, so every speculative API probe goes through here.
+function H.safeIndex(obj, key)
+	if obj == nil then
+		return nil
+	end
+	local ok, v = pcall(function()
+		return obj[key]
+	end)
+	if ok then
+		return v
+	end
+	return nil
+end
+
 function H.callable(obj, key)
 	return H.member(obj, key, "function")
 end
@@ -272,7 +312,7 @@ function H.fmtPan(v)
 	if math.abs(d) < 0.02 then
 		return "C"
 	end
-	local amt = math.floor(math.abs(d) * 200 + 0.5)
+	local amt = math.floor(math.abs(d) * 100 + 0.5)
 	return string.format("%s%d", d < 0 and "L" or "R", amt)
 end
 
@@ -489,31 +529,91 @@ local function scrConfigure(target, config)
 	sendSysex(SYSEX_HDR .. string.char(0x04, target, config))
 end
 
--- Queue one screen text field; identical content is skipped, and the queue is
--- pumped a few messages per timer tick so a repaint never floods the device.
+-- Queue one screen text field. Dedupe is per KEY over the pending queue,
+-- keeping the NEWEST text in its queue position (a positional index map would
+-- go stale: the overlay front-inserts and the pump removes from the front).
+-- The cache commits at SEND time (pumpScreen), so a queued-but-unsent text
+-- never blocks a newer one; the queue is pumped a few messages per timer tick
+-- so a repaint never floods the device.
 local function scrText(target, field, text)
 	text = H.screenText(text)
 	local key = tostring(target) .. ":" .. tostring(field)
+	for _, rec in ipairs(screenQueue) do
+		if rec.kind == "text" and rec.key == key then
+			rec.text = text -- already pending: replace its text, newest wins
+			return
+		end
+	end
 	if screenSent[key] == text then
 		return
 	end
-	screenSent[key] = text
-	screenQueue[#screenQueue + 1] = function()
-		sendSysex(SYSEX_HDR .. string.char(0x06, target, field) .. text)
-	end
+	screenQueue[#screenQueue + 1] = { kind = "text", key = key, target = target, field = field, text = text }
 end
+
+-- Display pacing (fw 1.1.11): the device needs spacing between display sysex
+-- (Ableton spaces them ~10 ms), so one 50 ms tick carries at most 2 text and
+-- 4 raw records. Queue order is preserved: a text record at the head whose
+-- budget is spent waits for the next tick instead of being reordered.
+local SCREEN_TEXTS_PER_TICK = 2
+local SCREEN_RAWS_PER_TICK = 4
 
 local function pumpScreen()
-	local budget = 6
-	while budget > 0 and #screenQueue > 0 do
-		local fn = table.remove(screenQueue, 1)
-		fn()
-		budget = budget - 1
+	-- post-burst re-assert: any tick that pumped text can lose trailing sysex
+	-- on the device (a single-key fader sweep included); on the first tick
+	-- with an empty queue afterwards, force-queue each remembered key's
+	-- last-sent text exactly once (cache bypass) and send it, so a device-side
+	-- drop cannot stick permanently.
+	if next(screenReassert) ~= nil and #screenQueue == 0 then
+		local reassert = screenReassert
+		screenReassert = {}
+		for key in pairs(reassert) do
+			local t, f = key:match("^(%d+):(%d+)$")
+			local text = screenSent[key]
+			if t ~= nil and text ~= nil then
+				__LCXL3_SCRETRIES[key] = (__LCXL3_SCRETRIES[key] or 0) + 1
+				if __LCXL3_SCRETRIES[key] < 2 then
+					-- up to 2 re-asserts: a device drop of the final text (or of
+					-- the first re-assert itself) must not stick as a wrong value
+					screenReassert[key] = true
+				end
+				screenQueue[#screenQueue + 1] = { kind = "text", key = key, target = tonumber(t), field = tonumber(f), text = text, forced = true }
+			end
+		end
 	end
-end
-
-local function screenDirty()
-	return #screenQueue > 0
+	local texts, raws = 0, 0
+	local pumped = nil -- keys of this tick's non-forced text sends
+	while #screenQueue > 0 and (texts < SCREEN_TEXTS_PER_TICK or raws < SCREEN_RAWS_PER_TICK) do
+		local rec = screenQueue[1]
+		if rec.kind == "text" then
+			if texts >= SCREEN_TEXTS_PER_TICK then
+				break -- text budget spent: the head record waits for the next tick
+			end
+			table.remove(screenQueue, 1)
+			sendSysex(SYSEX_HDR .. string.char(0x06, rec.target, rec.field) .. rec.text)
+			-- commit at SEND time: a queued-but-unsent text must not block a
+			-- newer one, and a dropped send must not look delivered
+			screenSent[rec.key] = rec.text
+			texts = texts + 1
+			if not rec.forced then
+				pumped = pumped or {}
+				pumped[#pumped + 1] = rec.key
+			end
+		else
+			if raws >= SCREEN_RAWS_PER_TICK then
+				break
+			end
+			table.remove(screenQueue, 1)
+			H.call(rec.fn)
+			raws = raws + 1
+		end
+	end
+	if pumped ~= nil then
+		-- every non-forced text re-arms (single-key sweeps included); the
+		-- re-assert itself stays one-shot and never re-arms (forced records)
+		for _, key in ipairs(pumped) do
+			screenReassert[key] = true
+		end
+	end
 end
 
 -- Overlay: a two-line temporary message (mode/page/probe changes, refusals).
@@ -524,23 +624,35 @@ end
 -- delay the overlay either.
 local function showOverlay(line1, line2)
 	local msgs = {}
+	local key0, key1 -- the overlay's two text keys
 	local function pushText(field, text)
 		text = H.screenText(text)
 		local key = tostring(SCR_TEMP) .. ":" .. tostring(field)
+		if field == 0 then
+			key0 = key
+		else
+			key1 = key
+		end
 		if screenSent[key] ~= text then
-			screenSent[key] = text
-			msgs[#msgs + 1] = function()
-				sendSysex(SYSEX_HDR .. string.char(0x06, SCR_TEMP, field) .. text)
-			end
+			msgs[#msgs + 1] = { kind = "text", key = key, target = SCR_TEMP, field = field, text = text }
 		end
 	end
 	pushText(0, line1)
 	pushText(1, line2 or "")
-	msgs[#msgs + 1] = function()
+	msgs[#msgs + 1] = { kind = "raw", fn = function()
 		sendSysex(SYSEX_HDR .. string.char(0x04, SCR_TEMP, CFG_TWOLINE))
-	end
-	msgs[#msgs + 1] = function()
+	end }
+	msgs[#msgs + 1] = { kind = "raw", fn = function()
 		sendSysex(SYSEX_HDR .. string.char(0x04, SCR_TEMP, 0x7F))
+	end }
+	-- the overlay texts are the newest for their keys: drop any pending record
+	-- for the same key deeper in the queue, or the pump would send the older
+	-- text AFTER the trigger and overwrite the overlay
+	for i = #screenQueue, 1, -1 do
+		local rec = screenQueue[i]
+		if rec.kind == "text" and (rec.key == key0 or rec.key == key1) then
+			table.remove(screenQueue, i)
+		end
 	end
 	for i = #msgs, 1, -1 do
 		table.insert(screenQueue, 1, msgs[i])
@@ -653,10 +765,6 @@ local function surfaceConfigure()
 	sendCC(CH_FEATURE, FEAT.encoderCurve, 1) -- medium
 end
 
-local function requestSurfaceMode(m)
-	sendCC(CH_FEATURE, FEAT.mode, m)
-end
-
 -----------------------------------------------------------------------------------------------
 -- MPC actions
 -----------------------------------------------------------------------------------------------
@@ -763,7 +871,13 @@ local function doRecord()
 	if not H.requireProject("record") then
 		return
 	end
-	if recordActive() and H.callable(mpc.sequencer, "RecordOff") then
+	if recordActive() and H.truthy(H.prop(mpc.sequencer, "OverdubState")) then
+		-- device-observed: with overdub-only raised, recordActive() is true and
+		-- RecordOff STOPS PLAYBACK. Arm full record instead of toggling off
+		-- (conservative shape until the transport probe decides the real one).
+		H.call(H.callable(mpc.sequencer, "Record"))
+		H.logOnce("recguard", "record: overdub-only state, RecordOff skipped (it stops playback); full record armed instead")
+	elseif recordActive() and H.callable(mpc.sequencer, "RecordOff") then
 		H.call(mpc.sequencer.RecordOff)
 	else
 		H.call(H.callable(mpc.sequencer, "Record"))
@@ -773,6 +887,16 @@ end
 
 local function doOverdub()
 	if not H.requireProject("overdub") then
+		return
+	end
+	if H.truthy(H.prop(mpc.sequencer, "OverdubState"))
+		and not H.truthy(H.prop(mpc.sequencer, "RecordState")) then
+		-- overdub-only recording: dropping overdub can stop playback
+		-- (device-observed; mirrors the record guard). Arm full record
+		-- first so playback is held, then toggle overdub off.
+		H.call(H.callable(mpc.sequencer, "Record"))
+		H.call(H.callable(mpc.sequencer, "Overdub"))
+		H.logOnce("odguard", "overdub: overdub-only state guarded (full record armed before overdub off)")
 		return
 	end
 	H.call(H.callable(mpc.sequencer, "Overdub"))
@@ -858,7 +982,7 @@ end
 
 -- Global parameters (control mode, row 3 global page) -------------------------
 
-local TIME_DIVISIONS = { "1/4", "1/8", "1/8T", "1/16", "1/16T", "1/32" }
+local TIME_DIVISIONS = { "1/4", "1/4T", "1/8", "1/8T", "1/16", "1/16T", "1/32", "1/32T" }
 
 local function quantiser()
 	return mpc.sequencer and mpc.sequencer.quantiser
@@ -887,8 +1011,11 @@ local function getSwing()
 	return tonumber(H.call(H.callable(quantiser(), "GetSwing"))) or 50
 end
 
+__LCXL3_SWING = nil -- device GetSwing lags (like the qlinks): step a shadow (global: main chunk is at its 200-local limit)
+
 local function setSwing(v)
-	H.call(H.callable(quantiser(), "SetSwing"), H.clamp(v, 50, 75))
+	__LCXL3_SWING = H.clamp(v, 50, 75)
+	H.call(H.callable(quantiser(), "SetSwing"), __LCXL3_SWING)
 end
 
 local function getStrength()
@@ -940,11 +1067,84 @@ local function toggleLoop()
 	return not cur
 end
 
-local function cycleAutomationFilter()
-	if not H.requireProject("autofilter") then
-		return
+-- Global automation filter type (control mode, row 3 col 6). The scalar
+-- Get/Set pair exists (LPP3 dump): the enum is enumerated lazily with restore
+-- on the first use - Advance until the type repeats (bounded), remember the
+-- order, then Set the original back - so CW/CCW stepping uses Set(list[...])
+-- and the overlay can show the ACTUAL type. If Get or Set are missing or
+-- erroring, the old CW-only Advance path stays as the degrade.
+local autoFilterTypes = nil -- enumerated type strings (lazy, first col-6 use)
+local autoFilterTried = false -- enumeration attempted once
+
+local function enumerateAutomationFilterTypes()
+	local p = mpc and mpc.project
+	local get = H.callable(p, "GetGlobalAutomationFilterType")
+	local set = H.callable(p, "SetGlobalAutomationFilterType")
+	local adv = H.callable(p, "AdvanceGlobalAutomationFilterType")
+	if get == nil or set == nil or adv == nil then
+		return nil
 	end
-	H.call(H.callable(mpc.project, "AdvanceGlobalAutomationFilterType"))
+	local t0 = H.call(get)
+	if t0 == nil then
+		H.logOnce("afnil", "autofilter enum: Get returned nothing")
+		return nil
+	end
+	local list = { t0 } -- RAW values for stepping; display via tostring
+	for _ = 1, 12 do
+		H.call(adv)
+		local t = H.call(get)
+		if t == nil then
+			H.logOnce("afnil2", "autofilter enum: Get returned nothing mid-cycle")
+			return nil
+		end
+		if t == t0 then
+			H.log(string.format("autofilter enum: %d types", #list))
+			return list
+		end
+		list[#list + 1] = t
+	end
+	if not pcall(set, t0) then -- no repeat within the bound: restore, treat as unavailable
+		H.logOnce("afrestore", "autofilter enum: restore failed; type left advanced")
+	end
+	H.logOnce("afbound", "autofilter enum: no cycle repeat within 12 advances")
+	return nil
+end
+
+local function cycleAutomationFilter(dir)
+	if not H.requireProject("autofilter") then
+		return nil
+	end
+	local p = mpc and mpc.project
+	if not autoFilterTried then
+		autoFilterTried = true
+		autoFilterTypes = enumerateAutomationFilterTypes()
+		if autoFilterTypes == nil then
+			H.logOnce("autofilter", "automation filter Get/Set unavailable: CW-only Advance fallback")
+		end
+	end
+	if autoFilterTypes ~= nil and #autoFilterTypes > 0 then
+		local cur = H.call(H.callable(p, "GetGlobalAutomationFilterType"))
+		local set = H.callable(p, "SetGlobalAutomationFilterType")
+		if cur ~= nil and set ~= nil then
+			local n = #autoFilterTypes
+			local idx = 1
+			for i, t in ipairs(autoFilterTypes) do
+				if t == cur then
+					idx = i
+					break
+				end
+			end
+			idx = ((idx - 1 + (dir > 0 and 1 or -1)) % n) + 1
+			local nextType = autoFilterTypes[idx]
+			if pcall(set, nextType) then
+				return tostring(nextType)
+			end
+			H.logOnce("autofilter", "automation filter Set failed: CW-only Advance fallback")
+		end
+	end
+	-- degrade: CW-only Advance per detent, no type readout
+	H.call(H.callable(p, "AdvanceGlobalAutomationFilterType"))
+	return nil
 end
 
 local function masterTrack()
@@ -960,13 +1160,19 @@ end
 
 local function nudgeMasterVolume(delta)
 	local tr = masterTrack()
-	if tr == nil then
+	-- only write over a REAL read: masterTracks[0].Volume is not the proven
+	-- fader path (device-disproven, probe pending), so no blind default write
+	local cur = tonumber(H.prop(tr, "Volume"))
+	if cur == nil then
+		H.logOnce("master-read", "master volume read failed (masterTracks[0].Volume path probe pending): no write")
 		return
 	end
-	local cur = tonumber(H.prop(tr, "Volume")) or 0.7
-	pcall(function()
+	local ok = pcall(function()
 		tr.Volume.value = H.clamp01(cur + delta)
 	end)
+	if not ok then
+		H.logOnce("master-write", "master volume write failed on masterTracks[0].Volume")
+	end
 end
 
 local function masterVolume()
@@ -988,8 +1194,24 @@ local function qlinkBank()
 	return dev.mappings and dev.mappings.controlSurface and dev.mappings.controlSurface.qlinks
 end
 
+-- Q-Link table access, guarded fallback chain: mpc.controlSurface.qlinks
+-- (proven path), else mpc.force.qlinks, else mpc.qlinks. A build that exposes
+-- the table nowhere is logged once so an inert Q-Link row explains itself in
+-- the journal.
 local function mpcQlinks()
-	return mpc.controlSurface and mpc.controlSurface.qlinks
+	local q = H.safeIndex(H.safeIndex(mpc, "controlSurface"), "qlinks")
+	if q ~= nil then
+		return q
+	end
+	q = H.safeIndex(H.safeIndex(mpc, "force"), "qlinks")
+	if q ~= nil then
+		return q
+	end
+	q = H.safeIndex(mpc, "qlinks")
+	if q == nil then
+		H.logOnce("qlinksapi", "qlinks API missing")
+	end
+	return q
 end
 
 local function qlinkAt(i)
@@ -997,13 +1219,7 @@ local function qlinkAt(i)
 	if q == nil then
 		return nil
 	end
-	local ok, o = pcall(function()
-		return q[i]
-	end)
-	if ok then
-		return o
-	end
-	return nil
+	return H.safeIndex(q, i)
 end
 
 local function qlinkCount()
@@ -1043,26 +1259,149 @@ local function qlinkValueString(i)
 	return tostring(H.call(H.callable(qlinkAt(i), "GetValueString")) or "")
 end
 
--- Drive Q-Link i by a relative delta (fallback path).
-local function twistQlink(i, delta)
+-- Twist call forms, tried in order. Sol2 userdata exposes Twist as a method;
+-- other builds return a plain function (dot form); fw 1.1.11 may also accept
+-- a second fine-adjust argument. A form that errors or leaves the value
+-- string unchanged falls through to the next one.
+-- Q-Link turn acceleration (fw 1.1.11 device feedback 2026-11-19): a script-side
+-- Twist of the raw +/-1 detent moves a Q-Link by ONE position of 128 (~0.16 dB
+-- on track level) -- imperceptible. Native MPC knobs accelerate; emulate that:
+-- sustained turning ramps the per-detent multiplier 1 -> 2 -> 4 -> 8, a pause
+-- of >200 ms resets it, so slow turns stay fine-grained.
+local qlinkAccel = {} -- [i] -> { tick = last detent tick, streak = consecutive detents }
+
+local function accelDelta(i, delta)
+	local a = qlinkAccel[i]
+	if a == nil or (ticks - (a.tick or -99)) > 4 then
+		a = { tick = ticks, streak = 0 }
+		qlinkAccel[i] = a
+	end
+	a.tick = ticks
+	a.streak = math.min(a.streak + 1, 32)
+	local mult = 1
+	if a.streak > 1 then
+		mult = 2
+	end
+	if a.streak > 5 then
+		mult = 4
+	end
+	if a.streak > 11 then
+		mult = 8
+	end
+	return delta * mult
+end
+
+-- Q-Link twists are DEFERRED to the timer context: the self-test proved Twist
+-- moves parameters from HandleTimer, while the same call from the MIDI input
+-- callback appears to be silently dropped on fw 1.1.11 (device session
+-- 2026-11-19: "Twist accepted" logged from a knob turn, parameter unmoved).
+local qlinkPending = {} -- { {i=..., delta=...}, ... } drained immediately (timer as backup)
+
+
+-- Drive Q-Link i by a relative delta (fallback path). Never errors: every
+-- form is pcalled, and when no Twist form moves the target the knob position
+-- is synced with SetPosition instead, with a one-line journal note -- this is
+-- the diagnostic the next hardware round needs.
+__LCXL3_IMMEDIATE = (__LCXL3_IMMEDIATE == nil) and true or __LCXL3_IMMEDIATE
+__LCXL3_QDIRTY = {} -- [i] = ticks of the last FAST twist (settle pending)
+
+local function settleQlink(i)
+	-- post-spin sync only: refresh the ring/display from the real position.
+	-- No parameter write, no SetValue nudge.
+	local q = qlinkAt(i)
+	if q == nil then
+		return
+	end
+	local pos = tonumber(H.call(H.callable(q, "GetPosition"))) or 0
+	H.call(H.callable(q, "SetPosition"), pos)
+	H.call(H.callable(q, "Touch"))
+	for knob = 0, 15 do -- find the knob that drives this Q-Link for the display
+		if QLINK_ORDER[knob + 1] == i then
+			showControl(encoderTarget(knob // 8, knob % 8), "Q-Link",
+				qlinkTargetName(i) or "Unassigned", qlinkValueString(i))
+			break
+		end
+	end
+end
+
+local function twistQlink(i, delta, fast)
 	local q = qlinkAt(i)
 	if q == nil then
 		return false
 	end
+	if fast then
+		-- hot path for active spins: 2 calls, no read-backs (they lag one
+		-- change on device and were the per-detent latency). The settle pass
+		-- in HandleTimer refreshes the ring once the spin goes quiet.
+		__LCXL3_QDIRTY[i] = ticks
+		H.call(H.callable(q, "Touch"))
+		local d = delta
+		if d > 127 then
+			d = 127
+		elseif d < -127 then
+			d = -127
+		end
+		H.call(H.callable(q, "Twist"), d)
+		return true
+	end
+	-- LPP3-exact Q-Link driver (LaunchpadProMK3 setQlinkPosition, device-proven
+	-- on MPC 3.10.1): every call is DOT-form. The method form passes the qlink
+	-- table into the C++ layer -- fw 1.1.11 page-corruption suspect -- and is
+	-- never used. Drive to an absolute target: dot-Twist (<=2 retries against
+	-- the GetPosition lag), then position-scaled SetValue when the value string
+	-- did not change, then SetPosition for the knob display.
+	local posBefore = tonumber(H.call(H.callable(q, "GetPosition"))) or 0
+	local target = H.clamp(posBefore + delta, 0, 127)
+	local before = tostring(H.call(H.callable(q, "GetValueString")) or "")
 	H.call(H.callable(q, "Touch"))
-	local ok = pcall(function()
-		q:Twist(delta)
-	end)
-	if not ok then
-		ok = H.call(H.callable(q, "Twist"), delta)
+	if type(q.Twist) == "function" then
+		for _ = 1, 2 do
+			local d = target - (tonumber(H.call(H.callable(q, "GetPosition")) or 0))
+			if d == 0 then
+				break
+			end
+			if d > 127 then
+				d = 127
+			elseif d < -127 then
+				d = -127
+			end
+			H.call(H.callable(q, "Twist"), d)
+		end
 	end
-	if not ok then
-		-- last resort: move the position directly (updates the value string only)
-		local pos = tonumber(H.call(H.callable(q, "GetPosition")) or 0)
-		H.call(H.callable(q, "SetPosition"), H.clamp(pos + delta, 0, 127))
-		H.logOnce("twist", "qlink Twist missing: SetPosition fallback")
+	local after = tostring(H.call(H.callable(q, "GetValueString")) or "")
+	if after == before and type(q.SetValue) == "function" then
+		local v = tonumber(H.call(H.callable(q, "GetValue")))
+		if type(v) == "number" and posBefore ~= 0 then
+			H.call(H.callable(q, "SetValue"), v * target / posBefore)
+		end
+		H.call(H.callable(q, "SetPosition"), target)
+	elseif type(q.SetPosition) == "function" then
+		H.call(q.SetPosition, target)
 	end
+	H.call(H.callable(q, "Touch"))
 	return true
+end
+
+local function drainQlinkPending()
+	if #qlinkPending == 0 then
+		return
+	end
+	local batch = qlinkPending
+	qlinkPending = {}
+	for _, t in ipairs(batch) do
+		local a = qlinkAccel[t.i]
+		twistQlink(t.i, t.delta, a ~= nil and (a.streak or 0) >= 2)
+	end
+end
+
+-- One-line journal diagnostic on entering control mode: proves the qlinks
+-- table was found and names what the first knob drives.
+local function logQlinkInventory()
+	if mpcQlinks() == nil or qlinkCount() <= 0 then
+		H.logOnce("qlinksnone", "qlinks: none exposed")
+		return
+	end
+	H.logOnce("qlinksinv", string.format("qlinks: count=%d first target '%s'", qlinkCount(), tostring(qlinkTargetName(0) or "")))
 end
 
 local function scriptOwnsRelCC(cc)
@@ -1071,7 +1410,34 @@ local function scriptOwnsRelCC(cc)
 end
 
 -- Hand rows 1-2 (relative CC 77-92) to the MPC Q-Links.
+local function clearNativeQLinkBindings()
+	-- early experiments bound some rel CCs to Q-Links natively; the bindings
+	-- persist in the project and keep driving Q-Links (backwards, via the
+	-- inverted fw 1.1.11 parser) behind the script's back. Sweep them.
+	local b = qlinkBank()
+	if b == nil or H.callable(b, "RemoveInfiniteCCToQLink") == nil then
+		return
+	end
+	local removed = 0
+	for i = 0, 15 do
+		for cc = REL0, REL0 + 15 do
+			if pcall(b.RemoveInfiniteCCToQLink, i, cc, CH_ANALOG) then
+				removed = removed + 1
+			end
+		end
+	end
+	if removed > 0 then
+		H.log(string.format("native qlink bindings swept: %d removed", removed))
+	end
+end
+
 local function mapQlinks()
+	if not QLINK_NATIVE_ROUTING then
+		qlinkFallback = true
+		clearNativeQLinkBindings()
+		H.logOnce("qlinkroute", "qlink native routing disabled (fw 1.1.11 direction inversion): script-side Twist active")
+		return
+	end
 	local b = qlinkBank()
 	if b == nil or H.callable(b, "AddInfiniteCCToQLink") == nil then
 		qlinkFallback = true
@@ -1080,22 +1446,41 @@ local function mapQlinks()
 	end
 	local m = dev.mappings and dev.mappings.script
 	local mapped = 0
-	for i = 0, 15 do
-		local cc = REL0 + i
+	for knob = 0, 15 do
+		local i = QLINK_ORDER[knob + 1] or knob -- MPC screen order
+		local cc = REL0 + knob
 		-- the script must not keep the CC while the MPC owns it
 		H.call(m and m.RemoveCCToScript, CH_ANALOG, cc)
-		local ok = pcall(b.AddInfiniteCCToQLink, CH_ANALOG, cc, i)
-		if not ok then
-			ok = pcall(b.AddInfiniteCCToQLink, i, CH_ANALOG, cc)
+		-- H4 order first (device-inferred: qlink, cc, channel); the two legacy
+		-- orders stay as error-fallbacks only
+		local bound = pcall(b.AddInfiniteCCToQLink, i, cc, CH_ANALOG)
+			or pcall(b.AddInfiniteCCToQLink, CH_ANALOG, cc, i)
+			or pcall(b.AddInfiniteCCToQLink, i, CH_ANALOG, cc)
+		-- NON-circular proof per encoder (query-flip): mapped after bind, gone
+		-- after remove, back after rebind. The old check trusted the same call
+		-- that mis-bound (mirrored argument forms), so it confirmed garbage.
+		local qmap = H.callable(b, "IsQLinkMappedInfinite")
+		local qrm = H.callable(b, "RemoveInfiniteCCToQLink")
+		local ok = bound and H.truthy(H.call(qmap, i, cc))
+		if ok then
+			H.call(qrm, i, cc)
+			ok = not H.truthy(H.call(qmap, i, cc))
 		end
-		local confirmed = H.call(H.callable(b, "IsQLinkMappedInfinite"), CH_ANALOG, cc)
-		if ok and H.truthy(confirmed) then
+		if ok then
+			H.call(H.callable(b, "AddInfiniteCCToQLink"), i, cc, CH_ANALOG)
+			ok = H.truthy(H.call(qmap, i, cc))
+		end
+		if ok then
+			H.call(H.callable(b, "SetInfiniteCCMagnitude"), i, cc, 1)
+			H.call(H.callable(b, "SetQLinkFineAdjust"), i, cc, false)
 			mapped = mapped + 1
-			H.call(H.callable(b, "SetInfiniteCCMagnitude"), CH_ANALOG, cc, 1)
-			H.call(H.callable(b, "SetQLinkFineAdjust"), CH_ANALOG, cc, false)
 		else
-			-- undo a half-successful mapping attempt and give the CC back to the script
-			H.call(H.callable(b, "RemoveInfiniteCCToQLink"), CH_ANALOG, cc)
+			-- undo any half-successful mapping attempt (all known argument
+			-- orders, so nothing stays hardware-bound unverified) and give the
+			-- CC back to the script: per-encoder fallback to twistQlink
+			H.call(qrm, i, cc)
+			H.call(qrm, CH_ANALOG, cc)
+			H.call(qrm, cc, CH_ANALOG)
 			H.call(m and m.AddCCToScript, CH_ANALOG, cc)
 		end
 	end
@@ -1117,7 +1502,8 @@ local function unmapQlinks()
 	local m = dev.mappings and dev.mappings.script
 	for i = 0, 15 do
 		local cc = REL0 + i
-		H.call(H.callable(b, "RemoveInfiniteCCToQLink"), CH_ANALOG, cc)
+		-- the argument form mapQlinks verified (qlink, cc)
+		H.call(H.callable(b, "RemoveInfiniteCCToQLink"), i, cc)
 		H.call(m and m.AddCCToScript, CH_ANALOG, cc)
 	end
 	qlinkRouted = false
@@ -1333,10 +1719,12 @@ end
 
 -- Pan ring: a continuous readout, not discrete categories. Direction sets the
 -- hue (blue L / orange R), distance from centre sets brightness with a steep
--- gamma (1.7): small offsets start almost black and only real panning lights
--- up, reaching the full-bright bases at the extremes -- high contrast end to end.
+-- gamma (1.7) on a 12% floor: the centre is a visible dim WHITE (distinct from
+-- both hues, device feedback 2026-11: black-at-centre was unreadable) and the
+-- hues fade in from it, reaching the full-bright bases at the extremes.
 local PAN_BASE_L = { 24, 72, 127 }
 local PAN_BASE_R = { 127, 60, 0 }
+local PAN_CENTRE = { 44, 44, 44 } -- centred pan: visible white, never black
 
 -- Value-scaled ring colour: every knob ring works the same way now -- a subtle
 -- dark tint of its base colour at zero, brighter as the value rises, full at
@@ -1382,7 +1770,17 @@ local function globalParamT(col)
 	elseif col == 5 then
 		return H.truthy(H.prop(mpc.sequencer, "Loop")) and 1 or 0
 	elseif col == 6 then
-		return 0.7 -- filter type: no scalar getter; fixed mid level
+		-- ring follows the enumerated filter-type position; the fixed mid level
+		-- stays as the degrade (not enumerated yet / type unreadable)
+		local cur = tostring(H.call(H.callable(mpc.project, "GetGlobalAutomationFilterType")) or "")
+		if autoFilterTypes ~= nil and cur ~= "" then
+			for i, t in ipairs(autoFilterTypes) do
+				if t == cur then
+					return (i - 1) / math.max(1, #autoFilterTypes - 1)
+				end
+			end
+		end
+		return 0.7
 	elseif col == 7 then
 		return H.clamp01(masterVolume())
 	end
@@ -1393,9 +1791,9 @@ local function panPalette(v)
 	v = H.clamp01(tonumber(v) or 0.5)
 	local d = math.abs(v - 0.5)
 	if d < 0.03 then
-		return PAL.off -- dead zone: treat as centred
+		return PAN_CENTRE -- dead zone: centred = visible white, distinct from the L/R hues
 	end
-	local t = math.min(1, d / 0.48) ^ 1.7
+	local t = 0.12 + 0.88 * math.min(1, d / 0.48) ^ 1.7 -- floor: fade in from the white, never black
 	local base = (v < 0.5) and PAN_BASE_L or PAN_BASE_R
 	return { math.floor(base[1] * t + 0.5), math.floor(base[2] * t + 0.5), math.floor(base[3] * t + 0.5) }
 end
@@ -1428,12 +1826,12 @@ local GLOBAL_COLOURS = {
 }
 
 local TRACK_PAGE_COLOURS = {
-	PAL.blue, -- pan
+	PAL.white, -- pan (col 0 paints the pan readout, not this base)
 	PAL.blue, -- send 1
-	PAL.darkBlue, -- send 2
+	PAL.purple, -- send 2 (device feedback 2026-11: dark blue was indistinguishable from blue)
 	PAL.turquoise, -- send 3
 	PAL.green, -- send 4
-	PAL.white, -- volume trim
+	PAL.orange, -- volume trim (was white: clashed with the white pan centre)
 	PAL.whiteDim,
 	PAL.whiteDim,
 }
@@ -1442,13 +1840,22 @@ local TRACK_PAGE_PARAMS = { "Pan", "Send1", "Send2", "Send3", "Send4", "Volume" 
 
 local function paintControlEncoders()
 	local n = qlinkCount()
-	for i = 0, 15 do
-		local row = math.floor(i / 8)
-		local col = i % 8
+	for knob = 0, 15 do
+		local row = math.floor(knob / 8)
+		local col = knob % 8
+		local i = qlinkIndexOfKnob(row, col) -- MPC screen order (QLINK_ORDER)
 		local pal = PAL.off
-		if i < n and qlinkTargetName(i) ~= nil then
-			-- Q-Link rows: hue marks the row, brightness follows the value
-			pal = valueScaled((row == 0) and PAL.turquoise or PAL.purple, qlinkValue(i))
+		if i < n then
+			local nm = qlinkTargetName(i)
+			if nm == nil or nm == "" then
+				-- an unassigned Q-Link (nil OR empty-string name on fw 1.1.11)
+				-- cannot be labelled: the ring stays dark and the journal
+				-- explains it once (the input path still drives it)
+				H.logOnce("qlinkname" .. i, "qlink " .. i .. " has no target name: ring dark")
+			else
+				-- Q-Link rows: hue marks the row, brightness follows the value
+				pal = valueScaled((row == 0) and PAL.turquoise or PAL.purple, qlinkValue(i))
+			end
 		end
 		ledSet(encoderTarget(row, col), pal)
 	end
@@ -1548,8 +1955,11 @@ local function setSurfaceMode(m)
 	end
 	local wasControl = (surfaceMode == MODE_CONTROL)
 	surfaceMode = m
+	lastAbs = {} -- fresh abs baselines on ANY mode change: a stale baseline
+	-- (e.g. absorbed during control mode) makes the first mixer turn JUMP
 	if m == MODE_CONTROL then
 		mapQlinks()
+		logQlinkInventory()
 	elseif wasControl then
 		unmapQlinks()
 	end
@@ -1639,8 +2049,13 @@ local function handleGlobalEncoder(col, delta)
 		setBpm(math.floor(bpm) + delta)
 		showControl(encoderTarget(2, col), "Global", "Tempo", string.format("%.1f", getBpm()))
 	elseif col == 1 then
-		setSwing(getSwing() + delta)
-		showControl(encoderTarget(2, col), "Global", "Swing", getSwing() .. "%")
+		-- step the shadow (GetSwing lags one change on device and once made the
+		-- knob stick at 75); the shadow is the source of truth while stepping
+		if __LCXL3_SWING == nil then
+			__LCXL3_SWING = H.clamp(getSwing(), 50, 75)
+		end
+		setSwing(__LCXL3_SWING + H.clamp(delta, -1, 1)) -- per-detent clamp: a flick must not jump percent steps
+		showControl(encoderTarget(2, col), "Global", "Swing", __LCXL3_SWING .. "%")
 	elseif col == 2 then
 		setStrength(getStrength() + delta)
 		showControl(encoderTarget(2, col), "Global", "Q Strength", getStrength() .. "%")
@@ -1662,10 +2077,8 @@ local function handleGlobalEncoder(col, delta)
 		end
 		showControl(encoderTarget(2, col), "Global", "Loop", on and "On" or "Off")
 	elseif col == 6 then
-		if delta > 0 then
-			cycleAutomationFilter()
-		end
-		showControl(encoderTarget(2, col), "Global", "Auto Filter", "cycle")
+		local t = cycleAutomationFilter(delta)
+		showControl(encoderTarget(2, col), "Global", "Auto Filter", t or "cycle")
 	elseif col == 7 then
 		nudgeMasterVolume(delta / 127)
 		showControl(encoderTarget(2, col), "Master", "Volume", H.gainToDb(masterVolume()))
@@ -1704,12 +2117,20 @@ local function handleControlEncoder(row, col, delta)
 		if qlinkRouted then
 			return -- the MPC owns these CCs; nothing reaches the script
 		end
-		local i = row * 8 + col
-		if qlinkTargetName(i) == nil then
-			return
+		local i = qlinkIndexOfKnob(row, col)
+		if qlinkAt(i) == nil then
+			return -- no Q-Link object behind this knob
 		end
-		twistQlink(i, delta)
-		showControl(encoderTarget(row, col), "Q-Link " .. (i + 1), qlinkTargetName(i), qlinkValueString(i))
+		-- Twist even when the target has no name: the name gate lives only in
+		-- the LED painter (which logs the dark ring); the display falls back
+		-- to "Unassigned". Deferred to the timer context (see qlinkPending).
+		qlinkPending[#qlinkPending + 1] = { i = i, delta = accelDelta(i, delta) }
+		if __LCXL3_IMMEDIATE then
+			drainQlinkPending() -- zero-wait twists (flag-off = timer-drain only)
+		end
+		local spinning = qlinkAccel[i] ~= nil and (qlinkAccel[i].streak or 0) >= 2
+		showControl(encoderTarget(row, col), "Q-Link", qlinkTargetName(i) or "Unassigned",
+			spinning and "" or qlinkValueString(i)) -- mid-spin values lag one change anyway
 		return
 	end
 	if controlPage == 0 then
@@ -1728,27 +2149,51 @@ local function handleEncoderRel(row, col, delta)
 	end
 end
 
--- Absolute encoder values only arrive if the relative-row enable failed; treat
--- them as a direct set (the degrade path).
+-- Device-observed (fw 1.1.11): row 1 never enables its relative mode and keeps
+-- emitting absolute CCs, while the enabled rows emit relative ones. Absolute
+-- input is therefore converted to deltas everywhere: a first sighting is
+-- absorbed as the baseline (no action), an impossible jump re-baselines
+-- (no action), and every other value nudges like the relative path - nothing
+-- is ever direct-written as value/127 again.
 local function handleEncoderAbs(row, col, value)
-	if surfaceMode ~= MODE_CONTROL or row < 2 then
-		local idx = H.visibleIdx(col)
-		local tr = H.trackAt(idx)
-		if tr == nil then
+	local i = row * 8 + col -- PHYSICAL knob key for the lastAbs baseline cache
+	local last = lastAbs[i]
+	lastAbs[i] = value
+	if last == nil then
+		return -- first sighting: absorb as the baseline, no action
+	end
+	local delta = value - last
+	if delta == 0 then
+		return
+	end
+	if math.abs(delta) > 32 then
+		return -- spike (stream mismatch): re-baseline only, no action
+	end
+	if surfaceMode == MODE_CONTROL then
+		if row < 2 then
+			if qlinkRouted then
+				return -- the MPC owns the rel CCs; abs must not double-step
+			end
+			local qi = qlinkIndexOfKnob(row, col) -- MPC screen order
+			qlinkPending[#qlinkPending + 1] = { i = qi, delta = accelDelta(qi, delta) }
+			if __LCXL3_IMMEDIATE then
+				drainQlinkPending() -- zero-wait twists (flag-off = timer-drain only)
+			end
+			local spinning = qlinkAccel[qi] ~= nil and (qlinkAccel[qi].streak or 0) >= 2
+			showControl(encoderTarget(row, col), "Q-Link",
+				qlinkTargetName(qi) or "Unassigned",
+				spinning and "" or qlinkValueString(qi)) -- mid-spin values lag one change anyway
 			return
 		end
-		local name = mixerParamFor(row)
-		setTrackValue(idx, name, value / 127)
-		local v = tonumber(getTrackValue(idx, name)) or 0
-		showControl(encoderTarget(row, col), H.prop(tr, "Name") or ("Track " .. idx + 1), name, (name == "Pan") and H.fmtPan(v) or H.fmtPercent(v))
-		markDirty()
+		if controlPage == 0 then
+			handleGlobalEncoder(col, delta)
+		else
+			handleTrackPageEncoder(col, delta)
+		end
 		return
 	end
-	local i = row * 8 + col
-	if value == 64 then
-		return
-	end
-	twistQlink(i, value > 64 and 1 or -1)
+	handleMixerEncoder(row, col, delta) -- same steps/text/LED as the rel path
+	markDirty()
 end
 
 -- Touch events (ch 15) --------------------------------------------------------
@@ -1771,8 +2216,8 @@ local function handleTouch(cc, on)
 		local row = math.floor(rel / 8)
 		local col = rel % 8
 		if surfaceMode == MODE_CONTROL and row < 2 then
-			local i = row * 8 + col
-			showControl(encoderTarget(row, col), "Q-Link " .. (i + 1), qlinkTargetName(i) or "Unassigned", qlinkValueString(i))
+			local i = qlinkIndexOfKnob(row, col)
+			showControl(encoderTarget(row, col), "Q-Link", qlinkTargetName(i) or "Unassigned", qlinkValueString(i))
 		end
 	end
 end
@@ -1866,7 +2311,9 @@ end
 -- Plain press actions (all fire on value > 0; Shift variants branch inside).
 local BP = {}
 BP[BTN.play] = function()
-	if isDoublePress(BTN.play) then
+	-- the rewind double-press is plain-only: a quick Shift+Play pair must act
+	-- as two shift-presses (stop / stop-all-clips), never rewind
+	if not shiftHeld and isDoublePress(BTN.play) then
 		doJumpStart()
 		return
 	end
@@ -1881,7 +2328,9 @@ BP[BTN.play] = function()
 	end
 end
 BP[BTN.record] = function()
-	if isDoublePress(BTN.record) then
+	-- the tap-tempo double-press is plain-only: a quick Shift+Record pair must
+	-- always take the overdub branch, never the RecordOff revert + tap path
+	if not shiftHeld and isDoublePress(BTN.record) then
 		-- the first press of the pair toggled record; undo that side effect
 		local st = pressState[BTN.record]
 		if st ~= nil and not st.rec and recordActive() then
@@ -2062,8 +2511,8 @@ local function refreshLastTouched()
 		return
 	end
 	if surfaceMode == MODE_CONTROL and lt.row < 2 then
-		local i = lt.row * 8 + lt.col
-		showControl(encoderTarget(lt.row, lt.col), "Q-Link " .. (i + 1), qlinkTargetName(i) or "Unassigned", qlinkValueString(i))
+		local i = qlinkIndexOfKnob(lt.row, lt.col)
+		showControl(encoderTarget(lt.row, lt.col), "Q-Link", qlinkTargetName(i) or "Unassigned", qlinkValueString(i))
 		return
 	end
 	if surfaceMode == MODE_MIXER then
@@ -2078,12 +2527,16 @@ end
 
 function LaunchControlXL3.HandleTimer()
 	ticks = ticks + 1
+	drainQlinkPending() -- leftovers if immediate mode is off (device-proven path)
+	for i, act in pairs(__LCXL3_QDIRTY) do
+		if (ticks - act) >= 2 then
+			__LCXL3_QDIRTY[i] = nil
+			settleQlink(i) -- post-spin ring/display sync (no parameter write)
+		end
+	end
 	if offsetPending then
 		offsetPending = false
 		learnTrackOffset()
-	end
-	if ticks % 10 == 0 then
-		blinkOn = not blinkOn
 	end
 	pumpScreen()
 	if repaintDirty then
@@ -2129,12 +2582,14 @@ function LaunchControlXL3.HandleTimer()
 	end
 end
 
+
 -----------------------------------------------------------------------------------------------
 -- Load / unload
 -----------------------------------------------------------------------------------------------
 
 -- (channel, cc) pairs the script registers; the MPC only delivers registered input.
 local SURFACE_CC = {}
+local function buildSurfaceCC() -- wrapper frees main-chunk for-loop locals (200 cap)
 for cc = FADER0, FADER0 + 7 do
 	SURFACE_CC[#SURFACE_CC + 1] = { CH_ANALOG, cc }
 end
@@ -2162,6 +2617,8 @@ end
 for _, cc in ipairs({ FEAT.mode, FEAT.edit, FEAT.shift }) do
 	SURFACE_CC[#SURFACE_CC + 1] = { CH_FEATURE, cc }
 end
+end
+buildSurfaceCC()
 
 local function routeSurface(toScript)
 	local m = dev.mappings and dev.mappings.script
@@ -2193,7 +2650,6 @@ function LaunchControlXL3.OnLoad()
 	qlinkRouted = false
 	qlinkFallback = false
 	ticks = 0
-	blinkOn = false
 	repaintDirty = true
 	lastLog = {}
 	ledCache = {}
@@ -2202,6 +2658,15 @@ function LaunchControlXL3.OnLoad()
 	faderArmed = {}
 	faderRef = {}
 	faderLast = {}
+	lastAbs = {} -- absolute-encoder baselines: first sighting per control is absorbed
+	autoFilterTried = false -- automation-filter enum: re-enumerate on load
+	autoFilterTypes = nil
+	screenReassert = {} -- post-burst re-assert set: nothing pending on a fresh load
+	__LCXL3_SWING = nil -- P1-1: a stale shadow would jump the real swing on re-entry
+	qlinkAccel = {} -- P1-2: pre-reload streaks must not continue (ticks reset)
+	qlinkPending = {} -- P2-1: detents queued before unload never leak into the new session
+	__LCXL3_QDIRTY = {} -- P2-2: pre-reload settle entries are meaningless after a tick reset
+	__LCXL3_SCRETRIES = {}
 	props = {}
 	boundTracks = {}
 	lastTouched = nil
@@ -2222,7 +2687,10 @@ function LaunchControlXL3.OnLoad()
 	end
 	scrConfigure(SCR_TEMP, CFG_TWOLINE)
 
-	requestSurfaceMode(MODE_MIXER)
+	-- No forced mixer request: after an acvs re-init the hardware may still be
+	-- in the DAW Control template, and the query below makes the device REPORT
+	-- its real mode (the reply adopts it via onModeReport) instead of us
+	-- stomping it to mixer and leaving the user's knob rows misrouted.
 	-- feature-control query (ch 8): the reply arrives on ch 7 CC 30 and is
 	-- logged by onModeReport -- an end-to-end proof that the session is live
 	sendCC(CH_QUERY, FEAT.mode, MODE_MIXER)

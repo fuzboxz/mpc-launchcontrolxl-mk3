@@ -54,7 +54,7 @@ for _ = 1, 20 do
 	L.HandleMIDICC(15, 77, 63)
 end
 assert_near(mock.tracks[0].Send1.value, 0, 0.0001, "sends clamp at 0")
-for _ = 1, 12 do
+for _ = 1, 40 do -- 2 texts/tick pacing: drain the queue plus its re-asserts
 	L.HandleTimer()
 end
 assert_eq(screenText(13, 1), "Send 1", "encoder display names the parameter")
@@ -68,29 +68,28 @@ assert_near(mock.tracks[0].Send1.value, 0, 0.0001, "Send 1 untouched on bank B")
 L.HandleMIDICC(15, 85, 65)
 assert_near(mock.tracks[0].Send4.value, 1 / 64, 0.0001, "bank B row 2 nudges Send 4")
 
--- Control mode: the device reports mode 2; the 16 upper encoders are hardware-
--- routed into the MPC Q-Links (decision 1a).
+-- Control mode: the device reports mode 2. Native Q-Link routing ships OFF
+-- (fw 1.1.11 direction inversion): the rel CCs stay script-owned and rows 1-2
+-- drive the Q-Links through the script-side Twist fallback.
 mock.reset()
 L.HandleMIDICC(6, 30, 2)
-local routed = mock.find("AddInfiniteCCToQLink")
-assert_eq(#routed, 16, "16 encoders routed to Q-Links")
-assert_eq(routed[1].args[1], 15, "routing on the analog channel")
-assert_eq(routed[1].args[2], 77, "first routed CC is 77")
-assert_eq(routed[1].args[3], 0, "first routed Q-Link is 0")
-assert_eq(routed[16].args[2], 92, "last routed CC is 92")
-assert_eq(mock.count("RemoveCCToScript") >= 16, true, "the script gave the CCs up")
-for _, c in ipairs(mock.find("SetInfiniteCCMagnitude")) do
-	assert_eq(c.args[3], 1, "infinite CC magnitude 1 detent")
+assert_eq(mock.count("AddInfiniteCCToQLink"), 0, "native routing disabled by default")
+assert_eq(mock.dev.mappings.script.IsCCMappedToScript(15, 77), true, "rel CCs stay script-owned")
+mock.setQlinkTarget(12, "Cutoff") -- row 1 col 1 = index 12 (screen order)
+L.HandleMIDICC(15, 77, 66) -- +2 on row 1 col 1 (Q-Link index 12)
+L.HandleTimer()
+assert_eq(mock.count("Twist"), 1, "the fallback drives the Q-Link through dot-form Twist")
+assert_near(mock.tracks[0].Send3.value, 1 / 64, 0.0001, "script-owned CCs never touch the mixer")
+for _ = 1, 40 do -- 2 texts/tick pacing: drain the queue plus its re-asserts
+	L.HandleTimer()
 end
--- while routed, the relative CCs must not reach the script's mixer handler
-L.HandleMIDICC(15, 77, 66)
-assert_near(mock.tracks[0].Send3.value, 1 / 64, 0.0001, "routed CCs do not touch the mixer")
+assert_eq(screenText(13, 1), "Cutoff", "fallback display names the Q-Link target")
 
 -- Global row (row 3) is still script-driven: tempo, swing, metronome, loop.
 L.HandleMIDICC(15, 93, 65) -- tempo +1
 assert_eq(mock.mpc.project.BPM.value, 121, "tempo nudged")
-L.HandleMIDICC(15, 93 + 1, 66) -- swing +2
-assert_eq(mock.mpc.sequencer.quantiser.GetSwing(), 56, "swing nudged")
+L.HandleMIDICC(15, 93 + 1, 66) -- accelerated CC (+2 raw): clamped to one percent step
+assert_eq(mock.mpc.sequencer.quantiser.GetSwing(), 55, "swing nudged (per-event clamp)")
 L.HandleMIDICC(15, 93 + 4, 65) -- metronome on
 assert_eq(mock.mpc.sequencer.MetronomeEnabled.value, true, "metronome on via CW turn")
 L.HandleMIDICC(15, 93 + 4, 63) -- metronome off
@@ -104,29 +103,29 @@ mock.tracks[0].Pan:set(0.5)
 L.HandleMIDICC(15, 93, 65) -- track page col 0 = pan of the CURRENT track
 assert_near(mock.tracks[0].Pan.value, 0.5 + 1 / 96, 0.0001, "track page col 0 nudges the current track's pan")
 
--- Back to mixer mode: the routing is undone and the CCs return to the script.
+-- Back to mixer mode: nothing was ever routed, so nothing is unmapped and the
+-- CCs never left the script.
 mock.reset()
 L.HandleMIDICC(6, 30, 1)
-assert_eq(mock.count("RemoveInfiniteCCToQLink"), 16, "Q-Link routing removed")
-assert_eq(mock.count("AddCCToScript") >= 16, true, "CCs returned to the script")
+assert_eq(mock.count("RemoveInfiniteCCToQLink"), 0, "nothing to unmap (routing was never armed)")
+assert_eq(mock.count("AddCCToScript"), 0, "CCs never left the script")
 L.HandleMIDICC(15, 93 + 5, 63)
 assert_near(mock.tracks[5].Pan.value, 0.5 - 2 / 127, 0.0001, "mixer encoders work again")
 
--- Script-side fallback when the mapping API is missing: rows 1-2 drive the
--- Q-Links with Twist deltas instead.
+-- Even without the mapping API at all, rows 1-2 keep the Twist path and the
+-- per-Q-Link display (a fresh target key so the screen cache cannot hide it).
 mock.dev.mappings.controlSurface = nil
-L.HandleMIDICC(6, 30, 2)
+L.HandleMIDICC(6, 30, 2) -- enter control mode without any mapping API
+mock.clearCalls()
 assert_eq(mock.count("Twist"), 0, "no Twist before any movement")
-mock.setQlinkTarget(0, "Cutoff")
-L.HandleMIDICC(15, 77, 66) -- +2 on Q-Link 1
-assert_eq(mock.count("Twist"), 1, "fallback routes the encoder through Twist")
-assert_eq(mock.find("Twist")[1].args[1], 0, "Twist targets Q-Link 0")
-assert_eq(mock.find("Twist")[1].args[2], 2, "Twist delta is the encoder delta")
-for _ = 1, 12 do
+mock.setQlinkTarget(4, "Drive") -- row 1 col 3 = group 1 third = Q-Link 5 (index 4)
+L.HandleMIDICC(15, 79, 65) -- +1 on row 1 col 3 -> Q-Link 3
+L.HandleTimer()
+assert_eq(mock.count("Twist"), 1, "no Twist-callable fallback still drives via the same path")
+for _ = 1, 40 do -- 2 texts/tick pacing: drain the queue plus its re-asserts
 	L.HandleTimer()
 end
-assert_eq(screenText(13, 1), "Cutoff", "fallback display names the Q-Link target")
-mock.dev.mappings.controlSurface = { qlinks = nil }
+assert_eq(screenText(15, 1), "Drive", "fallback display names the Q-Link target")
 L.OnUnload()
 _G.print = realPrint
 print("test-encoders: PASS")

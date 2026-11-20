@@ -27,6 +27,7 @@ function M.reset()
 	M.leds = {}
 	M.notes = {}
 	M.sysex = {}
+	twistNoEffect = false
 end
 
 function M.clearCalls()
@@ -93,7 +94,12 @@ local currentTrack = { Index = prop(0), Name = prop("Track 0"), Type = prop("Aud
 M.currentTrack = currentTrack
 
 local mockBpm = 120
-local mockSwing = 54
+-- Swing units (triage H2 favoured, probe 6 pending): the API speaks PERCENT
+-- (50..75). A one-line flip of SWING_IS_FRACTION switches the wire form to
+-- 0..1 if the probe shows H3 (Set expects a fraction).
+local SWING_IS_FRACTION = false
+local SWING_STALE = false -- GetSwing never moves (device lag emulation)
+local mockSwing = 54 -- percent; divided by 100 on the wire when SWING_IS_FRACTION
 local mockStrength = 90
 local mockDivision = "1/16"
 local mockPulses = 0 -- playhead position, 960 pulses per quarter
@@ -119,10 +125,16 @@ sequencer = {
 	RecordOff = function()
 		record("RecordOff")
 		sequencer.RecordState:set(0)
+		-- device-observed (w1/r1): with overdub-only raised, RecordOff also
+		-- STOPS playback; disarming a full record does not.
+		if sequencer.OverdubState.value ~= 0 and sequencer.Playing.value then
+			sequencer.Playing:set(false)
+		end
 	end,
 	Overdub = function()
 		record("Overdub")
 		sequencer.OverdubState:set(1)
+		sequencer.RecordState:set(1) -- device-observed: overdub-only raises recordActive()
 	end,
 	JumpToBeginning = function()
 		record("JumpToBeginning")
@@ -168,11 +180,21 @@ sequencer = {
 	quantiser = {
 		Enabled = prop(true),
 		GetSwing = function()
+			if SWING_STALE then
+				return 50 -- device emulation: the read lags every change (stuck-75 bug)
+			end
+			if SWING_IS_FRACTION then
+				return mockSwing / 100
+			end
 			return mockSwing
 		end,
 		SetSwing = function(v)
 			record("SetSwing", v)
-			mockSwing = v
+			if SWING_IS_FRACTION then
+				mockSwing = (tonumber(v) or 0) * 100
+			else
+				mockSwing = v
+			end
 		end,
 		GetStrength = function()
 			return mockStrength
@@ -192,16 +214,93 @@ sequencer = {
 }
 M.sequencer = sequencer
 
+-- Global automation filter: scalar Get/Set exist next to Advance (LPP3 dump
+-- :32); the enum contents are unproven on the device (probe 8 enumerates), so
+-- the mock models a 4-value cycle. Set refuses unknown types like the device.
+local FILTER_TYPES = { "Off", "Latch", "Touch", "Write" }
+local filterIndex = 1
+
 local project -- same forward-declaration pattern
 project = {
 	BPM = prop(mockBpm),
-	GlobalAutomationFilterType = prop("Post"),
+	GlobalAutomationFilterType = prop(FILTER_TYPES[filterIndex]),
+	GetGlobalAutomationFilterType = function()
+		record("GetGlobalAutomationFilterType")
+		return FILTER_TYPES[filterIndex]
+	end,
+	SetGlobalAutomationFilterType = function(t)
+		record("SetGlobalAutomationFilterType", t)
+		for i, name in ipairs(FILTER_TYPES) do
+			if name == t then
+				filterIndex = i
+				project.GlobalAutomationFilterType:set(t)
+				return
+			end
+		end
+		error("unknown automation filter type: " .. tostring(t))
+	end,
 	AdvanceGlobalAutomationFilterType = function()
 		record("AdvanceGlobalAutomationFilterType")
-		project.GlobalAutomationFilterType:set("Pre")
+		filterIndex = (filterIndex % #FILTER_TYPES) + 1
+		project.GlobalAutomationFilterType:set(FILTER_TYPES[filterIndex])
 	end,
 }
 M.project = project
+
+-- Device truth (triage r5): masterTracks[0] is NOT the master fader path.
+-- Default "dead": Volume reads 0.0 and writes are silently ignored (device D2/D3
+-- - a silent rejection is undetectable from Lua, so the script must not pretend
+-- it succeeded). "readonly": the write raises (read-only sol2 property) so the
+-- script logs it once. "nilread": Volume cannot be read (device D4), so the
+-- script must not write blindly. Tests prove a live slot with makeMasterLive().
+local masterSlot = { Name = prop("Master") }
+local masterMode = "dead"
+
+local function buildMasterVolume()
+	if masterMode == "readonly" then
+		return setmetatable({}, {
+			__index = function(_t, k)
+				if k == "value" then
+					return 0.0
+				end
+				return nil
+			end,
+			__newindex = function()
+				error("masterTracks[0].Volume is read-only")
+			end,
+		})
+	elseif masterMode == "nilread" then
+		return setmetatable({}, {
+			__index = function()
+				return nil
+			end,
+			__newindex = function()
+				error("masterTracks[0].Volume is read-only")
+			end,
+		})
+	end
+	-- dead (default): the write is swallowed, the read stays 0.0
+	return setmetatable({}, {
+		__index = function(_t, k)
+			if k == "value" then
+				return 0.0
+			end
+			return nil
+		end,
+		__newindex = function() end,
+	})
+end
+masterSlot.Volume = buildMasterVolume()
+
+function M.setMasterSlot(mode)
+	masterMode = mode or "dead"
+	masterSlot.Volume = buildMasterVolume()
+end
+
+function M.makeMasterLive()
+	masterMode = "live"
+	masterSlot.Volume = prop(0.8)
+end
 
 local commandManager = {
 	CanUndo = function()
@@ -239,24 +338,43 @@ local clipMatrix = {
 }
 M.sceneStates = sceneStates
 
--- Q-Links (mpc.controlSurface.qlinks, 0-based, 16 knobs)
+-- Q-Links (mpc.controlSurface.qlinks, 0-based, 16 knobs). Twist is the real
+-- knob rotation: it moves the position AND the target value string.
+-- SetPosition is the position-sync write: the knob moves, the value string
+-- stays (that is how the script detects a no-effect Twist). Twist has a
+-- plain dot-form signature: a method-form call passes the qlink table as the
+-- delta and fails loudly, so the script falls through to the next form.
 local qlinkTargets = {}
 local qlinkPositions = {}
+local qlinkValueStrings = {}
 M.qlinkPositions = qlinkPositions
+local twistNoEffect = false -- setTwistNoEffect(true): Twist lands, nothing moves
+local function qlinkPercent(pos)
+	return tostring(math.floor(pos / 127 * 100 + 0.5)) .. "%"
+end
 local qlinks = {}
 for i = 0, 15 do
 	qlinkPositions[i] = 64
+	qlinkValueStrings[i] = qlinkPercent(64)
 	qlinks[i] = {
 		GetPosition = function()
+			record("GetPosition")
 			return qlinkPositions[i]
 		end,
 		SetPosition = function(pos)
-			qlinkPositions[i] = pos
+			qlinkPositions[i] = math.max(0, math.min(127, pos))
 			record("SetPosition", i, pos)
 		end,
 		Twist = function(delta)
-			qlinkPositions[i] = math.max(0, math.min(127, qlinkPositions[i] + delta))
+			if type(delta) ~= "number" then
+				error("Twist expects a numeric delta, got " .. type(delta))
+			end
+			if twistNoEffect then
+				error("Twist unavailable") -- simulates a firmware without a callable Twist
+			end
 			record("Twist", i, delta)
+			qlinkPositions[i] = math.max(0, math.min(127, qlinkPositions[i] + delta))
+			qlinkValueStrings[i] = qlinkPercent(qlinkPositions[i])
 		end,
 		Touch = function()
 			record("Touch", i)
@@ -264,8 +382,14 @@ for i = 0, 15 do
 		GetValue = function()
 			return qlinkPositions[i] / 127
 		end,
+		SetValue = function(v)
+			record("SetValue", i, v)
+			qlinkPositions[i] = math.max(0, math.min(127, math.floor((tonumber(v) or 0) * 127 + 0.5)))
+			qlinkValueStrings[i] = qlinkPercent(qlinkPositions[i])
+		end,
 		GetValueString = function()
-			return tostring(math.floor(qlinkPositions[i] / 127 * 100 + 0.5)) .. "%"
+			record("GetValueString")
+			return qlinkValueStrings[i]
 		end,
 		GetTargetName = function()
 			-- false marks an explicitly unassigned Q-Link (returns nil)
@@ -281,6 +405,15 @@ qlinks.GetNumQLinks = function()
 end
 M.setQlinkTarget = function(i, name)
 	qlinkTargets[i] = name
+end
+M.setTimeDivision = function(v)
+	mockDivision = v
+end
+M.setSwingStale = function(v)
+	SWING_STALE = v and true or false
+end
+M.setTwistNoEffect = function(v)
+	twistNoEffect = v and true or false
 end
 M.qlinkPosition = function(i)
 	return qlinkPositions[i]
@@ -306,7 +439,7 @@ end
 M.mpc = {
 	tracks = {
 		normalTracks = tracks,
-		masterTracks = { [0] = { Volume = prop(0.8), Name = prop("Master") } },
+		masterTracks = { [0] = masterSlot },
 		currentTrack = currentTrack,
 		Count = prop(NUM_TRACKS),
 		GetCount = function()
@@ -381,29 +514,35 @@ local function scriptMappings()
 end
 
 local function qlinkMappings()
-	local key = function(ch, cc)
-		return tostring(ch) .. ":" .. tostring(cc)
+	-- Device-inferred (H4) argument order: the QLINK INDEX comes first, then
+	-- the CC, then an optional channel. Keyed per qlink+cc so the script's
+	-- query-flip self-verification gets a truthful counterpart: a legacy
+	-- channel-first bind lands under the wrong key and the (qlink, cc) query
+	-- fails it, instead of confirming the mis-bind like the old mock did.
+	local key = function(qi, cc)
+		return tostring(qi) .. ":" .. tostring(cc)
 	end
+	local CH_ANALOG = 15 -- the script's analog channel (faders + encoders)
 	return {
-		AddInfiniteCCToQLink = function(ch, cc, idx)
-			record("AddInfiniteCCToQLink", ch, cc, idx)
-			M.qlinkMapped[key(ch, cc)] = idx
+		AddInfiniteCCToQLink = function(qi, cc, ch)
+			record("AddInfiniteCCToQLink", qi, cc, ch)
+			M.qlinkMapped[key(qi, cc)] = ch or CH_ANALOG
 		end,
-		RemoveInfiniteCCToQLink = function(ch, cc)
-			record("RemoveInfiniteCCToQLink", ch, cc)
-			M.qlinkMapped[key(ch, cc)] = nil
+		RemoveInfiniteCCToQLink = function(qi, cc, ch)
+			record("RemoveInfiniteCCToQLink", qi, cc, ch)
+			M.qlinkMapped[key(qi, cc)] = nil
 		end,
-		IsQLinkMappedInfinite = function(ch, cc)
-			return M.qlinkMapped[key(ch, cc)] ~= nil
+		IsQLinkMappedInfinite = function(qi, cc)
+			return M.qlinkMapped[key(qi, cc)] ~= nil
 		end,
-		AddAbsoluteCCToQLink = function(ch, cc, idx)
-			record("AddAbsoluteCCToQLink", ch, cc, idx)
+		AddAbsoluteCCToQLink = function(qi, cc, ch)
+			record("AddAbsoluteCCToQLink", qi, cc, ch)
 		end,
-		SetInfiniteCCMagnitude = function(ch, cc, mag)
-			record("SetInfiniteCCMagnitude", ch, cc, mag)
+		SetInfiniteCCMagnitude = function(qi, cc, mag)
+			record("SetInfiniteCCMagnitude", qi, cc, mag)
 		end,
-		SetQLinkFineAdjust = function(ch, cc, fine)
-			record("SetQLinkFineAdjust", ch, cc, fine)
+		SetQLinkFineAdjust = function(qi, cc, fine)
+			record("SetQLinkFineAdjust", qi, cc, fine)
 		end,
 	}
 end
@@ -455,6 +594,29 @@ M.dev = {
 		end,
 	},
 }
+
+-- Fake device CC emitter: drives the loaded script the way the surface streams
+-- input on the analog channel (faders 5-12, abs encoders 13-36, rel 77-100).
+-- Only CCs the script registered are delivered - the device never sends
+-- unregistered input, so a routing bug shows up as silence, not a wrong write.
+local function emitCC(ch, cc, value)
+	if not M.dev.mappings.script.IsCCMappedToScript(ch, cc) then
+		return
+	end
+	_G.LaunchControlXL3.HandleMIDICC(ch, cc, value)
+end
+
+function M.emitFader(col, value)
+	emitCC(15, 5 + col, value)
+end
+
+function M.emitAbs(row, col, value)
+	emitCC(15, 13 + row * 8 + col, value)
+end
+
+function M.emitRel(row, col, delta)
+	emitCC(15, 77 + row * 8 + col, 64 + delta)
+end
 
 -- Test helper: decode the screen sysex stream into {op=..., target=..., ...}.
 function M.screen()

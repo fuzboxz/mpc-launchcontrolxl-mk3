@@ -188,7 +188,7 @@ L.HandleMIDICC(0, 103, 127) -- back to bank 0
 
 -- The stationary screen shows the position and the transport state.
 L.OnLoad() -- fresh caches so the screen lines are (re)sent, not deduped
-ticks(12)
+ticks(40) -- 2 texts/tick pacing: the load map plus its re-asserts need ~28 ticks
 local sawPos, sawBpm = false, false
 for _, m in ipairs(mock.screen()) do
 	if m.op == "text" and m.target == 53 then
