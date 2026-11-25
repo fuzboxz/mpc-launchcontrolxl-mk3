@@ -92,8 +92,6 @@ is called out where it exists. Root-cause analysis for the v1.1.0 behaviour is i
 ### Known limitations
 
 - The overdub Record-LED flash remains in the default path (opt-in clean path only).
-- `docs/MAPPING.md` and `docs/LIMITATIONS.md` still describe the v1.1.0 Q-Link order and superseded
-  claims (the code comments are authoritative).
 
 ## 1.1.0 — hardware-hardening pass
 

@@ -65,26 +65,39 @@ colours.
 
 **Rows 1-2 (16 encoders) = MPC Q-Links 0-15**, script-driven: every movement is
 translated into `qlinks[i].Touch()` + `Twist(delta)` by the script (`SetPosition`
-only as a last resort — it does not reach the edit value). The knob ORDER mirrors the MPC's Q-Link
-screen (device-confirmed 2026-11-20): the screen lists four groups read top-to-bottom —
-group 1 = Q-Links 13,9,5,1, group 2 = 14,10,6,2, group 3 = 15,11,7,3, group 4 =
-16,12,8,4 — so **XL3 row 1 = groups 1+2 and row 2 = groups 3+4**, each group's four
-slots left-to-right on the knob row: row 1 `{12,8,4,0,13,9,5,1}` / row 2
-`{14,10,6,2,15,11,7,3}`. Turning the top-left knob moves the screen's group-1 top slot
-(Q-Link 13). Native hardware routing
-(`AddInfiniteCCToQLink`) is **disabled by default**: on XL3 fw 1.1.11 the MPC's
-infinite-CC parser runs inverted vs the XL3 binary offset, so knobs turn parameters
-the wrong way. Device findings 2026-11, probe pending
-(`reports/00-FINAL-TRIAGE.md` §5). When the direction/magnitude probe allows
-re-enabling, it binds in the device-inferred `(qlink, cc, channel)` order and
-self-verifies per encoder non-circularly (remove/rebind query-flip) before trusting
-it; the routing sequence stays:
+only as a last resort — it does not reach the edit value).
+
+The knob ORDER follows the Q-Link set that is loaded, because the MPC assigns the
+slots differently per page (both verified on hardware, 2026-11-20 and 2026-11-25):
+
+| Loaded set | Knob → Q-Link | Why |
+|---|---|---|
+| Track / plugin page | row 1 `{12,8,4,0,13,9,5,1}`, row 2 `{14,10,6,2,15,11,7,3}` (column-major groups of four) | the plugin fills its slots in that order — e.g. OPx macros 1-4 land on Q-Links 13,9,5,1, so the top-left knob is Macro 1 |
+| Global / main page | identity, row 1 `{0..7}`, row 2 `{8..15}` | the global parameters sit at indices 0-15 in screen order (`0` TRACK LEVEL, `1` PLAYHEAD, `4` TIME DIVISION, …), so the top-left knob is TRACK LEVEL |
+
+The set is identified from the Q-Link target names — the API exposes no page or
+selection property (`qlink.Selected` does not exist) — and logged once as
+`qlink order: global (identity …)` / `qlink order: track (column-major …)`. It is
+re-evaluated on control-mode entry and on the 500 ms refresh; unreadable names (a
+project still loading) keep the current order, whose default is the track table.
+
+A page-interleaved variant (4 pages × 4 slots: row-1 knob 1, row-1 knob 5, row-2
+knob 1, row-2 knob 5 → Q-Links 1-4) was tried on hardware and **rejected** — it
+reverses plugin macros — so it must not be reintroduced without new device evidence.
+
+Native hardware routing (`AddInfiniteCCToQLink`) is **disabled by default**: the MPC
+parser's expected encoding for the XL3's binary offset is still unprobed (the earlier
+"direction inverted" reading was never verified), so all 16 Q-Links are driven
+script-side. When a direction/magnitude probe allows re-enabling, it uses Akai's
+shipped signatures and self-verifies per encoder non-circularly (remove/rebind
+query-flip) before trusting it; the routing sequence stays:
 
 | Step | Call |
 |---|---|
 | give the CC up | `mappings.script.RemoveCCToScript(15, 77+i)` |
-| route it | `AddInfiniteCCToQLink(i, 77+i, 15)` (arg order: Q-Link first — device-inferred [H4]; verified non-circularly) |
-| tune it | `SetInfiniteCCMagnitude(i, 77+i, 1)`, `SetQLinkFineAdjust(i, 77+i, false)` |
+| route it | `AddInfiniteCCToQLink(15, 77+i, i)` — `(channel, cc, qlinkIndex)`, Akai's shipped order |
+| drop it again | `RemoveInfiniteCCToQLink(15, 77+i)` — same two-argument form |
+| tune it | `SetQLinkFineAdjust(false)` (single bool); `SetInfiniteCCMagnitude` is never called |
 
 LED: turquoise (row 1) / purple (row 2) when the Q-Link has a target name,
 dark when unassigned. Screen: `Q-Link n` / target name / value string.

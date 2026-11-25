@@ -71,19 +71,20 @@ marked **[p0]** (Phase-0 probe).
   `GetValue()`, `GetValueString()`, `GetTargetName()`. **[dv]**
 - `dev.mappings.controlSurface.qlinks`: `AddInfiniteCCToQLink`,
   `RemoveInfiniteCCToQLink`, `IsQLinkMappedInfinite`, `AddAbsoluteCCToQLink`,
-  `SetInfiniteCCMagnitude`, `SetQLinkFineAdjust`. Present in the binary dump;
-  signatures unproven — the script probes two argument orders and verifies with
-  `IsQLinkMappedInfinite`. **[p0]** Hardware input *does* flow through `dev.mappings`
-  (only script-emitted MIDI does not loop back). **[dv]**
+  `SetInfiniteCCMagnitude`, `SetQLinkFineAdjust`. Present in the binary dump.
+  Signatures follow Akai's shipped scripts — `AddInfiniteCCToQLink(channel, cc,
+  qlinkIndex)`, `RemoveInfiniteCCToQLink(channel, cc)`, `SetQLinkFineAdjust(bool)` —
+  and the script verifies each binding non-circularly (remove/rebind query flip). **[p0]**
+  Hardware input *does* flow through `dev.mappings` (only script-emitted MIDI does not
+  loop back). **[dv]**
 - `mpc.controlSurface.qlink.Selected` / a `LastTouchedQlink` helper do **not** exist in
   the dump — the stationary screen's focus line degrades to `-`.
 
-> **Hardware findings 2026-11** (probe pending): both probed argument orders for
-> `AddInfiniteCCToQLink` are wrong on device — the true order is inferred as
-> `(qlink, cc, channel)` [H4, uniquely fits the observed mis-binding], and the MPC
-> parser's sign is inverted vs the XL3 binary offset (direction device-proven,
-> magnitude open). The script therefore ships native routing **disabled** (script-side
-> `Twist` for all 16). Probe list: `reports/00-FINAL-TRIAGE.md` §5.
+> **Hardware findings 2026-11** (probe pending): the MPC parser's expected encoding for
+> the XL3's binary offset is unprobed — an earlier "argument order" and "inverted sign"
+> reading was not verified against the shipped signatures above. The script therefore
+> ships native routing **disabled** (script-side `Twist` for all 16). Probe list:
+> `reports/00-FINAL-TRIAGE.md` §5.
 
 ## 5. Virtual MPC buttons
 
@@ -108,7 +109,7 @@ state is readable for any of them. **[dv]**
 2. No per-track MIDI input from Lua; no track input routing. **[dv]**
 3. Cannot edit a non-selected track/clip — select first. **[dv]**
 4. `qlinks.GetPosition()` lags one change; `SetPosition` doesn't reach the edit value
-   → prefer hardware routing or `Twist`. **[dv]**
+   → drive Q-Links script-side with `Touch` + `Twist`. **[dv]**
 5. Script-emitted MIDI does not loop back through `dev.mappings`. **[dv]**
 6. Project-scoped native calls can abort the app while a popup owns the UI → guard on
    `engineMode.CurrentPopup`. **[dv]**
