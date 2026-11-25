@@ -204,3 +204,32 @@ Shift + Novation toggles it. Every incoming message is logged
 (`probe ch=<ch> cc=<cc> value=<v>`) and the pressed control lights white (relative CCs
 light their absolute index). Shift and the Novation button stay live so probe mode can
 be exited from the device.
+
+## Tunables and flags
+
+Set these as globals before the script loads (they are read once at load, except
+`__LCXL3_OD_CLEAN`, which re-arms after every load). `tools/check-docs.sh` fails when a
+flag or Q-Link feel field exists in the script but is missing here.
+
+| Global | Default | Effect |
+|---|---|---|
+| `__LCXL3_QFEEL` | table, see below | Q-Link gesture feel — the one table to tune encoder response |
+| `__LCXL3_IMMEDIATE` | `true` | twist inside the MIDI context (zero-wait first response); `false` queues every detent to the 50 ms tick |
+| `__LCXL3_HWPICKUP` | `true` | send the feature pickup CC so hardware pickup measures against script-sent fader positions; `false` leaves the software guard alone |
+| `__LCXL3_OD_CLEAN` | `false` | opt-in overdub toggle without the `Record` pre-arm: playback verified for two ticks, automatic fallback to the default sequence |
+| `__LCXL3_OD_GUARD` | `false` | per-session latch, set when the clean path had to fall back (stops it retrying mid-session) |
+| `__LCXL3_NATIVE` | `false` | native `AddInfiniteCCToQLink` routing instead of script-side `Twist`; ships off because the parser encoding is unprobed |
+| `__LCXL3_QTRACE` | `0` | internal per-session gesture-trace counter, bounded by `traceGestures` |
+| `__LCXL3_SCRETRIES` | `{}` | internal per-key screen re-assert budget (at most 2 per burst) |
+| `__LCXL3_SWING` | retired | superseded by the `H.step["swing"]` shadow; the name survives only in a comment |
+
+`__LCXL3_QFEEL` fields:
+
+| Field | Default | Effect |
+|---|---|---|
+| `gapTicks` | 3 | detents closer than this (150 ms) belong to the same gesture |
+| `rateTicks` | 3 | window used to measure the turn rate that picks the gain |
+| `maxMult` | 4 | gain ceiling — raise for faster sweeps, lower if a flick still runs away |
+| `settleTicks` | 3 | quiet time before the settle pass re-reads the knob |
+| `absUnitsPerDetent` | 1 | row-1 absolute units per detent (device-measurable; see the probe captures) |
+| `traceGestures` | 40 | journal trace lines per session, then silent |

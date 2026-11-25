@@ -24,15 +24,38 @@ curl -o references/launch_control_xl_3_user_guide.pdf \
 ## Workflow
 
 1. `./tests/run-tests.sh` must pass before every commit (syntax, ini gate, manual
-   freshness, mock suite, minified-artifact suite).
+   freshness, docs gate, mock suite, minified-artifact suite).
 2. Enable the git hooks once per clone: `git config core.hooksPath .githooks`.
-3. Any change to the mapping must be reflected in the `ACTIONS` table inside
-   `script/LaunchControlXL3.lua` — `docs/MANUAL.md` is generated from it and the test
-   suite fails when it drifts.
+3. Documentation is part of the change, not a follow-up. `docs/MANUAL.md` is generated
+   from the `ACTIONS` table; `docs/MAPPING.md` is the behaviour reference and
+   `docs/LIMITATIONS.md` the walls. `tools/check-docs.sh` (run by the suite) fails the
+   build when the manual is stale, when the Q-Link knob order in the script is not
+   quoted in `MAPPING.md`, or when a `__LCXL3_*` flag / `QFEEL` field is undocumented.
+   See [Documentation is part of the change](#documentation-is-part-of-the-change).
 4. Any new optional MPC API call must be pcall-guarded and log its absence exactly
    once (`H.logOnce`). Degrade, never break.
 5. Device-verified facts get a `docs/DEVICE-TEST-PLAN.md` entry and a line in
    `docs/REVIEW.md`; unverified guesses get a Phase-0 probe item instead.
+
+## Documentation is part of the change
+
+A behaviour change that leaves the docs behind is an incomplete change — the v1.1.0
+Q-Link knob order shipped wrong for two releases because `docs/MAPPING.md` was never
+re-checked against `QLINK_ORDER`. Update these in the **same commit**:
+
+| You changed | You must update |
+|---|---|
+| the `ACTIONS` table, a control label, a mode/page description | `docs/MANUAL.md` (regenerate: `tools/gen-manual.sh`) — the suite fails if it is stale |
+| what any control does, a knob order, an LED or screen meaning, a call sequence | `docs/MAPPING.md` |
+| a new device wall, unprobed API, or unverified claim | `docs/LIMITATIONS.md` (+ `docs/API-CONTRACT.md` if it is an API fact) |
+| a new `__LCXL3_*` flag or `__LCXL3_QFEEL` field | `docs/MAPPING.md` "Tunables and flags" — `tools/check-docs.sh` fails otherwise |
+| user-visible behaviour | `CHANGELOG.md`, in the section for the version being released |
+
+Rules of thumb: a claim that was probed and **disproven** must be retired from the docs
+in the same commit that changes the code (do not leave the old reading beside the new
+one); anything still unverified must say so rather than assert a direction or a
+signature. `tools/check-docs.sh` covers the mechanical part (manual freshness, the
+Q-Link order rows, documented flags) — the rest is a review responsibility.
 
 ## Signing
 

@@ -14,6 +14,9 @@ tools/check-ini.sh script/LaunchControlXL3.ini.in template
 echo "== generated manual =="
 tools/gen-manual.sh --check
 
+echo "== check-docs (manual freshness + Q-Link order + documented flags) =="
+tools/check-docs.sh
+
 SELENE="${SELENE:-$(command -v selene || true)}"
 if [ -n "$SELENE" ] && [ -x "$SELENE" ]; then
   echo "== selene =="
