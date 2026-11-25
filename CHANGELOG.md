@@ -1,6 +1,101 @@
 # Changelog
 
-## Unreleased
+## 1.1.1 — 2026-11-25
+
+Fixes for the bug report from the 2026-11 hardware session (MPC Live III 3.10.1.8, XL3 fw 1.1.11).
+Every item is covered by the host suite (`cd tests && sh run-tests.sh`: 26 test files, run against
+both the source and the minified shipped artifact, ending `ALL TESTS PASS`); hardware confirmation
+is called out where it exists. Root-cause analysis for the v1.1.0 behaviour is in
+`reports/00-FINAL-TRIAGE.md`.
+
+### Q-Links (control mode, rows 1-2)
+
+- **Encoder feel**: gain now comes from the measured turn rate, 1x..**4x** (v1.1.0 ramped to 8x, so
+  a half sweep ran the whole range); a slow turn moves exactly one position per detent. Tunable via
+  `__LCXL3_QFEEL{gapTicks, rateTicks, maxMult, settleTicks, absUnitsPerDetent, traceGestures}`.
+- **No more closed-loop twisting**: detents coalesce to one `Twist` per knob per tick, the first one
+  still fires immediately in the MIDI context; the shadow position is clamped 0..127 and the normal
+  path issues no `GetPosition`/`GetValueString` read-backs and no `SetPosition`/`SetValue` writes
+  (the v1.1.0 loop double-twisted under the device's one-change read lag, then "corrected" the ring).
+- **Value never disappears**: the value line is never blank (cached device string, `-` fallback);
+  the settle pass re-reads once, adopts the device position and **logs drift** instead of writing.
+- **Settle re-arms on every detent**, so a steady 150 ms cadence still gets its closing pass (drift
+  check, closing `Touch`, final re-read).
+- **Knob order follows the loaded Q-Link set** — the device exposes no page/selection property
+  (`API-CONTRACT.md:78`), so the set is identified from its target names and logged:
+  - track/plugin pages keep the column-major table `{12,8,4,0,13,9,5,1}` / `{14,10,6,2,15,11,7,3}`
+    (OPx macros come out 1-4 ascending);
+  - the global/main page uses identity, because its parameters sit at indices 0..15 in order
+    (0 `TRACK LEVEL`, 1 `PLAYHEAD`, 4 `TIME DIVISION`, …);
+  - a page-interleaved variant (4 pages x 4 slots) was tried on hardware and **rejected** (plugin
+    macros came out reversed); it must not be reintroduced without new device evidence.
+  - unreadable names (project still loading) keep the current order — the default is column-major,
+    i.e. the shipped behaviour.
+- **Per-knob stream lock**: a device that emits absolute *and* relative on the same knob cannot
+  double-step; the first stream wins and the ignored one is logged once. The row-1 absolute path
+  handles the 0/127 wrap and carries the fractional remainder (`absUnitsPerDetent`).
+
+### Continuous parameters (shadow steppers)
+
+- Sends, pan, track page, tempo, strength, swing and master now step from the last value the script
+  wrote and only re-read after 300 ms of quiet — a 12-detent flick applies 12 steps instead of 3
+  (the v1.1.0 read-modify-write stalled on lagging reads).
+- **Swing** no longer jumps to max: the shadow re-syncs after quiet, the unit (percent vs fraction)
+  is auto-detected, and the display always reads `NN%`.
+- **Timing division** advances one step per **two** detents, saturating, with the flip resetting the
+  accumulator (was one list step per message off a lagging read).
+- **Automation filter** no longer flips on/off: saturating two-detent steps (CW ends on the last
+  type, CCW on the first), enumeration that survives read lag across timer ticks, and the CW-only
+  `Advance` path as the degrade.
+- **Metronome and loop** are *set* to the direction's state instead of toggling a stale read.
+
+### Faders
+
+- Pickup references are re-read after load, every 2 s, and on a track-count change for faders that
+  were never picked — so a fader no longer needs a trip to minimum first. No blind writes while a
+  fader is off-reference; `__LCXL3_HWPICKUP = false` restores the old behaviour.
+- Hardware evidence: `fader 1 reference 0 -> 90 (project readable after load)`.
+
+### Transport / overdub
+
+- The raw transport numbers are journaled before and after every overdub toggle (`overdub: before
+  …/after …`), which is what makes the LED behaviour diagnosable from the field.
+- Opt-in `__LCXL3_OD_CLEAN = true`: no `Record` pre-arm, playback verified for two ticks with an
+  automatic fallback. The **default sequence is unchanged** — the Record LED still flashes briefly
+  when overdub turns off (cosmetic; the flash is the pre-arm, not a transport change).
+
+### Native Q-Link routing
+
+- Corrected to Akai's shipped signatures — `AddInfiniteCCToQLink(channel, cc, qlinkIndex)`,
+  `RemoveInfiniteCCToQLink(channel, cc)`, `SetQLinkFineAdjust(bool)` — with per-encoder verification
+  via a non-circular remove/rebind query flip, an honest CC sweep, and per-encoder fallback.
+- Ships **off** (`__LCXL3_NATIVE = false`): the MPC parser's expected encoding for the XL3's binary
+  offset is still unprobed, and the comments now say so instead of asserting a direction.
+
+### Tests and tooling
+
+- The mock gained the device's read-lag behaviour (`mock.setReadLag(n)`, ticked by
+  `mock.tick`/`runTicks`), plus unreadable-volume and overdub-toggle switches.
+- Seven new regression files — `test-mock-lag`, `test-qlink-gesture`, `test-shadow-step`,
+  `test-fader-pickup-resync`, `test-overdub-clean`, `test-native-routing`, `test-qlink-order` — each
+  proven to fail against the v1.1.0 script at the intended defect.
+- The suite runs the whole set twice: against the source and against the minified artifact that is
+  actually shipped.
+
+### Signing
+
+- The salt provenance is documented in the script header: `checksum = sha256(lua_bytes .. salt)`,
+  salt read from the MPC 3.10.0.49 Gen2 firmware update image `MPC-3.10.0.49-gen2`
+  (md5 `15a664f6b6ae591c8b78baae8b376f02`, build id `2209920bc0a`) at offset `0x5287C10` with XOR
+  key `0x5F694973D3C78945`, plus the tooling and the `MPC_SALT` override.
+
+### Known limitations
+
+- The overdub Record-LED flash remains in the default path (opt-in clean path only).
+- `docs/MAPPING.md` and `docs/LIMITATIONS.md` still describe the v1.1.0 Q-Link order and superseded
+  claims (the code comments are authoritative).
+
+## 1.1.0 — hardware-hardening pass
 
 Fixes from the 2026-11 hardware session (MPC Live III, XL3 fw 1.1.11); full triage in
 `reports/00-FINAL-TRIAGE.md`. The hardware-probe session is still pending (triage §5),

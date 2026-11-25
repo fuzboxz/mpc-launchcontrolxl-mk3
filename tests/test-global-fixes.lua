@@ -57,54 +57,82 @@ assert_eq(sets[3], 53, "third detent reaches 53 while GetSwing still says 50")
 -- tests; here the SetSwing sequence above is the behaviour under test)
 mock.setSwingStale(false)
 
--- 2. time divisions ----------------------------------------------------------
-local divisions = {}
-local function currentDivision()
-	for i = #mock.find("SetTimeDivision"), 1, -1 do
-		local v = mock.find("SetTimeDivision")[i].args[1]
-		if v ~= nil then
-			return v
-		end
+-- 2. time divisions (T2 contract): ONE list step per TWO detents, saturating
+--    at 1/4 and 1/32T (never a wrap), and a direction flip resets the
+--    accumulator. Each phase opens with 7 quiet ticks (> STEP_QUIET = 6) so
+--    the stepper drops any stale shadow and re-anchors from the device state
+--    the phase sets; inside the quiet window the shadow legitimately wins.
+local divisions
+local function writtenDivisions()
+	divisions = {}
+	for _, c in ipairs(mock.find("SetTimeDivision")) do
+		divisions[#divisions + 1] = tostring(c.args[1])
 	end
-	return nil
+	return divisions
+end
+local function detents(n, cc)
+	for _ = 1, n do
+		L.HandleMIDICC(15, 96, cc) -- row 3 col 3 (division), +-1 detent
+		L.HandleTimer()
+	end
 end
 mock.clearCalls()
 mock.setTimeDivision("1/4") -- start at the list head
-for _ = 1, 10 do
-	L.HandleMIDICC(15, 96, 65) -- CW
-	L.HandleTimer()
-end
-for _ = 1, 12 do
-	L.HandleMIDICC(15, 96, 63) -- CCW
-	L.HandleTimer()
-end
-divisions = {}
-for _, c in ipairs(mock.find("SetTimeDivision")) do
-	divisions[#divisions + 1] = tostring(c.args[1])
-end
-local cwRun = table.concat(divisions, ",")
-assert_eq(cwRun:find("1/4T", 1, true) ~= nil, true, "CW from 1/4 steps through the 1/4T triplet")
-assert_eq(cwRun:find("1/32T", 1, true) ~= nil, true, "the list reaches 1/32T")
-assert_eq(divisions[#divisions] ~= "1/4T" or true, true, "CCW stepping runs (list walked back)")
+mock.runTicks(L, 7)
+detents(5, 65) -- CW
+writtenDivisions()
+assert_eq(#divisions, 2, "five CW detents apply exactly two list steps (one per two detents)")
+assert_eq(divisions[1], "1/4T", "the first full pair steps 1/4 -> 1/4T")
+assert_eq(divisions[2], "1/8", "the second pair steps 1/4T -> 1/8")
 
--- CW clamp at the head, CCW clamp at the tail
+detents(12, 65) -- saturate at the tail: four more pairs, then silent
+writtenDivisions()
+assert_eq(#divisions, 7, "twelve more detents add five steps then clamp at the tail")
+assert_eq(divisions[#divisions], "1/32T", "the list saturates at 1/32T")
+local tailSeen = 0
+for _, d in ipairs(divisions) do
+	if d == "1/32T" then
+		tailSeen = tailSeen + 1
+	end
+end
+assert_eq(tailSeen, 1, "1/32T is written once: saturation never wraps")
+
+-- a direction flip resets the accumulator: after an odd CW detent a full CCW
+-- pair still steps back (without the reset it would only cancel the residue)
+mock.clearCalls()
+mock.setTimeDivision("1/16")
+mock.runTicks(L, 7)
+detents(2, 65) -- full CW pair: write 1/16T
+L.HandleMIDICC(15, 96, 65) -- fresh CW residue 1/2, no write
+L.HandleMIDICC(15, 96, 63) -- flip: residue discarded, no write
+L.HandleMIDICC(15, 96, 63) -- full CCW pair: write 1/16
+writtenDivisions()
+assert_eq(#divisions, 2, "the flip test writes once per full pair in each direction")
+assert_eq(divisions[1], "1/16T", "the CW pair steps 1/16 -> 1/16T")
+assert_eq(divisions[2], "1/16", "the CCW pair steps back to 1/16 (flip reset the accumulator)")
+
+-- saturation is a NO-WRITE clamp at both ends (two full pairs each way)
 mock.clearCalls()
 mock.setTimeDivision("1/4")
-L.HandleMIDICC(15, 96, 63) -- CCW at the minimum: clamped, no call below the list
-assert_eq(#mock.find("SetTimeDivision") <= 1, true, "CCW below 1/4 clamps")
+mock.runTicks(L, 7)
+detents(4, 63) -- CCW below 1/4
+assert_eq(#mock.find("SetTimeDivision"), 0, "CCW below 1/4 clamps without a write")
 mock.clearCalls()
 mock.setTimeDivision("1/32T")
-L.HandleMIDICC(15, 96, 65) -- CW at the maximum: clamped
-assert_eq(#mock.find("SetTimeDivision") <= 1, true, "CW above 1/32T clamps")
+mock.runTicks(L, 7)
+detents(4, 65) -- CW above 1/32T
+assert_eq(#mock.find("SetTimeDivision"), 0, "CW above 1/32T clamps without a write")
 
 -- 3. native binding sweep ----------------------------------------------------
 mock.clearCalls()
 L.HandleMIDICC(6, 30, 1) -- leave control (mixer)
 mock.clearCalls()
 L.HandleMIDICC(6, 30, 2) -- re-enter: mapQlinks fallback sweeps stale bindings
-local swept = mock.find("RemoveInfiniteCCToQLink")
-assert_eq(#swept >= 256, true, "the sweep covers all 16 qlinks x 16 rel CCs (" .. #swept .. " calls)")
-assert_eq(swept[1].args[3], 15, "the sweep passes the H4 (qlink, cc, channel) order")
+local queried = mock.find("IsQLinkMappedInfinite")
+assert_eq(#queried == 24, true, "the sweep queries every honest (channel, cc) key, cc 77..100 (" .. #queried .. ")")
+assert_eq(queried[1].args[1], 15, "the sweep uses Akai's channel-first (channel, cc) key")
+assert_eq(queried[1].args[2], 77, "the sweep starts at the first relative CC")
+assert_eq(mock.count("RemoveInfiniteCCToQLink"), 0, "nothing stored: the query-gated sweep removes only real bindings")
 
 -- 4. abs baselines reset on mode change --------------------------------------
 L.HandleMIDICC(15, 13, 60) -- control mode: row 1 col 1 baseline absorbed
@@ -121,6 +149,7 @@ for _ = 1, 4 do
 	L.HandleTimer()
 end
 mock.clearCalls()
+mock.clearSysex() -- measure THIS window only: earlier sections' display texts are not the re-assert contract
 logs = {}
 for v = 20, 80, 15 do
 	L.HandleMIDICC(15, 5, v) -- one fader, quick burst

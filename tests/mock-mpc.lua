@@ -1,5 +1,7 @@
 -- tests/mock-mpc.lua: a minimal MPC 3.10.1 API mock for the Launch Control XL 3 script.
 -- Records every call; decodes LED RGB sysex into M.leds[cc] = "r,g,b".
+-- Optional read lag (device fact: Q-Link getters and mixer/quantiser/BPM/filter reads
+-- report one change behind): mock.setReadLag(n), advanced by mock.tick(L) / mock.runTicks(L, n).
 
 local M = { calls = {}, leds = {}, notes = {}, sysex = {}, scriptCCs = {}, qlinkMapped = {} }
 
@@ -22,16 +24,150 @@ function M.count(name)
 	return #M.find(name)
 end
 
+-----------------------------------------------------------------------------------------------
+-- Read lag (device fact: property reads and the Q-Link getters report one change behind).
+-- Default OFF: with lag 0 every read is instantaneous, which is the world the whole
+-- existing suite assumes. mock.setReadLag(n) arms an n-tick delay: a write made at tick t
+-- reaches readers at tick t + n. The lag clock advances only in mock.tick / mock.runTicks
+-- -- a bare L.HandleTimer() does not move it, so old tests keep their exact behaviour.
+-----------------------------------------------------------------------------------------------
+local lagN = 0
+local lagClock = 0
+local lagReg = {} -- [owner table] = { [field] = { real = fn, visible = v, queue = {...} } }
+local twistNoEffect = false -- setTwistNoEffect(true): Twist lands, nothing moves
+local volUnreadable = false -- setVolumesUnreadable(true): track Volume reads return nil
+local odToggleStopsPlayback = false -- T4: Overdub() od-off also stops playback (F10 defect)
+-- (the F9 world: the loader cached the script before the project was readable)
+
+local function lagSeal(owner, field, realGet)
+	local o = lagReg[owner]
+	if not o then
+		o = {}
+		lagReg[owner] = o
+	end
+	local e = o[field]
+	if not e then
+		e = { real = realGet, visible = realGet(), queue = {} }
+		o[field] = e
+	end
+	return e
+end
+
+-- Record a write to a lagged observable. Call BEFORE mutating device truth: the entry
+-- seeds its visible view with the pre-write value and, with a lag armed, the new value
+-- reaches readers only after lagN ticks.
+local function lagStage(owner, field, realGet, newValue)
+	local e = lagSeal(owner, field, realGet)
+	if lagN > 0 then
+		e.queue[#e.queue + 1] = { due = lagClock + lagN, value = newValue }
+	end
+end
+
+local function lagView(owner, field, realGet)
+	if lagN <= 0 then
+		return realGet()
+	end
+	local o = lagReg[owner]
+	local e = o and o[field]
+	if not e then
+		return realGet()
+	end
+	return e.visible
+end
+
+-- Clear the lag model: drop pending writes and re-sync every visible view with truth
+-- (used by setReadLag and reset).
+local function lagReseed()
+	lagClock = 0
+	for _, o in pairs(lagReg) do
+		for _, e in pairs(o) do
+			e.visible = e.real()
+			e.queue = {}
+		end
+	end
+end
+
+function M.setReadLag(n)
+	lagN = math.max(0, math.floor(tonumber(n) or 0))
+	lagReseed()
+end
+
+-- Hostile native-mapping host: AddInfiniteCCToQLink accepts anything and stores
+-- nothing -- the mis-bind case the script's query-flip verification must detect.
+function M.setNativeMappingHostile(v)
+	M.nativeMappingHostile = v == true
+end
+
+function M.readLag()
+	return lagN
+end
+
+function M.setVolumesUnreadable(b)
+	volUnreadable = not not b
+end
+
+-- T4 (F10): arm the device-observed defect where Overdub() turning overdub off
+-- also STOPS playback (only while overdub-only: a guard-armed full record holds).
+-- Default off — the defect is modelled only when a test asks for it.
+function M.setOverdubToggleStopsPlayback(b)
+	odToggleStopsPlayback = not not b
+end
+
+local function lagAdvance()
+	lagClock = lagClock + 1
+	if lagN <= 0 then
+		return
+	end
+	for _, o in pairs(lagReg) do
+		for _, e in pairs(o) do
+			while e.queue[1] and e.queue[1].due <= lagClock do
+				e.visible = e.queue[1].value
+				table.remove(e.queue, 1)
+			end
+		end
+	end
+end
+
+-- dev.timer.Now() backing clock: one tick is the script's 50 ms timer interval
+-- (dev.timer.Start(50)); mock.advanceMs adds extra ms for tests.
+local now = 0
+
+-- One timer tick: advance the lag clock and the device clock, then run the script timer.
+function M.tick(L)
+	lagAdvance()
+	now = now + 50
+	L.HandleTimer()
+end
+
+function M.runTicks(L, n)
+	for _ = 1, (n or 0) do
+		M.tick(L)
+	end
+end
+
+function M.advanceMs(ms)
+	now = now + (ms or 0)
+end
+
 function M.reset()
 	M.calls = {}
 	M.leds = {}
 	M.notes = {}
 	M.sysex = {}
+	M.qlinkMapped = {} -- audit 2 M4: bindings must not leak across tests
+	M.nativeMappingHostile = false
 	twistNoEffect = false
+	volUnreadable = false
+	odToggleStopsPlayback = false
+	lagReseed()
 end
 
 function M.clearCalls()
 	M.calls = {}
+end
+
+function M.clearSysex()
+	M.sysex = {}
 end
 
 local function prop(v)
@@ -54,6 +190,46 @@ local function prop(v)
 end
 M.prop = prop
 
+-- A read-lagged property (Volume/Pan/Send1..4/project.BPM): :set keeps prop()'s exact
+-- write semantics (device value moves, listeners fire immediately) and direct .value
+-- writes (the script writes mixer/BPM props that way) keep their no-listener semantics
+-- -- but while a read lag is armed the .value read returns the delayed view.
+local function laggedProp(v, isVolume)
+	local p = prop(v)
+	local real = v
+	local realGet = function()
+		return real
+	end
+	p.value = nil -- reads must reach the metatable's lagged view
+	function p:set(v2)
+		lagStage(p, "value", realGet, v2)
+		real = v2
+		for _, fn in ipairs(p.listeners) do
+			pcall(fn, v2)
+		end
+	end
+	setmetatable(p, {
+		__index = function(t, k)
+			if k == "value" then
+				if volUnreadable and isVolume then
+					return nil -- device truth exists; it is just not readable right now
+				end
+				return lagView(t, "value", realGet)
+			end
+			return nil
+		end,
+		__newindex = function(t, k, v2)
+			if k == "value" then
+				lagStage(t, "value", realGet, v2)
+				real = v2
+				return
+			end
+			rawset(t, k, v2)
+		end,
+	})
+	return p
+end
+
 -----------------------------------------------------------------------------------------------
 -- mpc.*
 -----------------------------------------------------------------------------------------------
@@ -61,13 +237,15 @@ M.prop = prop
 local NUM_TRACKS = 16
 local tracks = {}
 for i = 0, NUM_TRACKS - 1 do
+	-- Volume/Pan/Send1..4 are read-lagged observables (device reads report one change
+	-- behind); the flags and metadata stay plain instant props.
 	local t = {
-		Volume = prop(0.7),
-		Pan = prop(0.5),
-		Send1 = prop(0),
-		Send2 = prop(0),
-		Send3 = prop(0),
-		Send4 = prop(0),
+		Volume = laggedProp(0.7, true),
+		Pan = laggedProp(0.5),
+		Send1 = laggedProp(0),
+		Send2 = laggedProp(0),
+		Send3 = laggedProp(0),
+		Send4 = laggedProp(0),
 		Mute = prop(false),
 		Solo = prop(false),
 		RecArm = prop(false),
@@ -104,6 +282,22 @@ local mockStrength = 90
 local mockDivision = "1/16"
 local mockPulses = 0 -- playhead position, 960 pulses per quarter
 
+-- Owner table for the closure-backed scalars' lag cells (the real storage is a local
+-- upvalue, so the lag model keys the cell off this table instead).
+local scalarLag = {}
+local function getBpmRaw()
+	return mockBpm
+end
+local function getSwingRaw()
+	return mockSwing
+end
+local function getStrengthRaw()
+	return mockStrength
+end
+local function getDivisionRaw()
+	return mockDivision
+end
+
 local sequencer -- declared first: the closures below must capture the local, not a global
 sequencer = {
 	Play = function()
@@ -133,8 +327,24 @@ sequencer = {
 	end,
 	Overdub = function()
 		record("Overdub")
-		sequencer.OverdubState:set(1)
-		sequencer.RecordState:set(1) -- device-observed: overdub-only raises recordActive()
+		if sequencer.OverdubState.value ~= 0 then
+			-- the real overdub key toggles: with overdub already raised, Overdub()
+			-- drops it (the v1.1.0 guard exists exactly for that transition)
+			sequencer.OverdubState:set(0)
+			-- device-observed (w1/r1): dropping overdub-only while playing stops
+			-- playback. Modelled only when a test arms the switch; a guard-armed
+			-- full record (RecordState raised by Record() before the toggle) holds.
+			if
+				odToggleStopsPlayback
+				and sequencer.RecordState.value == 0
+				and sequencer.Playing.value
+			then
+				sequencer.Playing:set(false)
+			end
+		else
+			sequencer.OverdubState:set(1)
+			sequencer.RecordState:set(1) -- device-observed: overdub-only raises recordActive()
+		end
 	end,
 	JumpToBeginning = function()
 		record("JumpToBeginning")
@@ -172,10 +382,11 @@ sequencer = {
 	end,
 	SetBPM = function(bpm)
 		record("SetBPM", bpm)
+		lagStage(scalarLag, "bpm", getBpmRaw, bpm)
 		mockBpm = bpm
 	end,
 	GetBPM = function()
-		return mockBpm
+		return lagView(scalarLag, "bpm", getBpmRaw)
 	end,
 	quantiser = {
 		Enabled = prop(true),
@@ -183,31 +394,37 @@ sequencer = {
 			if SWING_STALE then
 				return 50 -- device emulation: the read lags every change (stuck-75 bug)
 			end
+			local raw = lagView(scalarLag, "swing", getSwingRaw)
 			if SWING_IS_FRACTION then
-				return mockSwing / 100
+				return raw / 100
 			end
-			return mockSwing
+			return raw
 		end,
 		SetSwing = function(v)
 			record("SetSwing", v)
+			local nextRaw
 			if SWING_IS_FRACTION then
-				mockSwing = (tonumber(v) or 0) * 100
+				nextRaw = (tonumber(v) or 0) * 100
 			else
-				mockSwing = v
+				nextRaw = v
 			end
+			lagStage(scalarLag, "swing", getSwingRaw, nextRaw)
+			mockSwing = nextRaw
 		end,
 		GetStrength = function()
-			return mockStrength
+			return lagView(scalarLag, "strength", getStrengthRaw)
 		end,
 		SetStrength = function(v)
 			record("SetStrength", v)
+			lagStage(scalarLag, "strength", getStrengthRaw, v)
 			mockStrength = v
 		end,
 		GetTimeDivision = function()
-			return mockDivision
+			return lagView(scalarLag, "division", getDivisionRaw)
 		end,
 		SetTimeDivision = function(v)
 			record("SetTimeDivision", v)
+			lagStage(scalarLag, "division", getDivisionRaw, v)
 			mockDivision = v
 		end,
 	},
@@ -219,19 +436,25 @@ M.sequencer = sequencer
 -- the mock models a 4-value cycle. Set refuses unknown types like the device.
 local FILTER_TYPES = { "Off", "Latch", "Touch", "Write" }
 local filterIndex = 1
+local function getFilterRaw()
+	return FILTER_TYPES[filterIndex]
+end
 
 local project -- same forward-declaration pattern
 project = {
-	BPM = prop(mockBpm),
+	-- BPM is a lagged prop: the script writes mpc.project.BPM.value directly, which the
+	-- prop's __newindex routes through the same lag model (no listeners, as before).
+	BPM = laggedProp(mockBpm),
 	GlobalAutomationFilterType = prop(FILTER_TYPES[filterIndex]),
 	GetGlobalAutomationFilterType = function()
 		record("GetGlobalAutomationFilterType")
-		return FILTER_TYPES[filterIndex]
+		return lagView(scalarLag, "filter", getFilterRaw)
 	end,
 	SetGlobalAutomationFilterType = function(t)
 		record("SetGlobalAutomationFilterType", t)
 		for i, name in ipairs(FILTER_TYPES) do
 			if name == t then
+				lagStage(scalarLag, "filter", getFilterRaw, name)
 				filterIndex = i
 				project.GlobalAutomationFilterType:set(t)
 				return
@@ -241,7 +464,9 @@ project = {
 	end,
 	AdvanceGlobalAutomationFilterType = function()
 		record("AdvanceGlobalAutomationFilterType")
-		filterIndex = (filterIndex % #FILTER_TYPES) + 1
+		local nextIndex = (filterIndex % #FILTER_TYPES) + 1
+		lagStage(scalarLag, "filter", getFilterRaw, FILTER_TYPES[nextIndex])
+		filterIndex = nextIndex
 		project.GlobalAutomationFilterType:set(FILTER_TYPES[filterIndex])
 	end,
 }
@@ -344,11 +569,24 @@ M.sceneStates = sceneStates
 -- stays (that is how the script detects a no-effect Twist). Twist has a
 -- plain dot-form signature: a method-form call passes the qlink table as the
 -- delta and fails loudly, so the script falls through to the next form.
+-- The getters read through the lag model: with a read lag armed they report
+-- one write behind, like the device.
 local qlinkTargets = {}
 local qlinkPositions = {}
 local qlinkValueStrings = {}
-M.qlinkPositions = qlinkPositions
-local twistNoEffect = false -- setTwistNoEffect(true): Twist lands, nothing moves
+-- Exposed view: reads give device truth; test-side writes route through the lag
+-- model too, so a device-side move also reads back with the armed lag.
+M.qlinkPositions = setmetatable({}, {
+	__index = function(_t, k)
+		return qlinkPositions[k]
+	end,
+	__newindex = function(_t, k, v)
+		lagStage(qlinkPositions, k, function()
+			return qlinkPositions[k]
+		end, v)
+		qlinkPositions[k] = v
+	end,
+})
 local function qlinkPercent(pos)
 	return tostring(math.floor(pos / 127 * 100 + 0.5)) .. "%"
 end
@@ -359,10 +597,16 @@ for i = 0, 15 do
 	qlinks[i] = {
 		GetPosition = function()
 			record("GetPosition")
-			return qlinkPositions[i]
+			return lagView(qlinkPositions, i, function()
+				return qlinkPositions[i]
+			end)
 		end,
 		SetPosition = function(pos)
-			qlinkPositions[i] = math.max(0, math.min(127, pos))
+			local clamped = math.max(0, math.min(127, pos))
+			lagStage(qlinkPositions, i, function()
+				return qlinkPositions[i]
+			end, clamped)
+			qlinkPositions[i] = clamped
 			record("SetPosition", i, pos)
 		end,
 		Twist = function(delta)
@@ -373,23 +617,47 @@ for i = 0, 15 do
 				error("Twist unavailable") -- simulates a firmware without a callable Twist
 			end
 			record("Twist", i, delta)
-			qlinkPositions[i] = math.max(0, math.min(127, qlinkPositions[i] + delta))
-			qlinkValueStrings[i] = qlinkPercent(qlinkPositions[i])
+			local np = math.max(0, math.min(127, qlinkPositions[i] + delta))
+			lagStage(qlinkPositions, i, function()
+				return qlinkPositions[i]
+			end, np)
+			qlinkPositions[i] = np
+			lagStage(qlinkValueStrings, i, function()
+				return qlinkValueStrings[i]
+			end, qlinkPercent(np))
+			qlinkValueStrings[i] = qlinkPercent(np)
 		end,
 		Touch = function()
 			record("Touch", i)
 		end,
 		GetValue = function()
-			return qlinkPositions[i] / 127
+			return lagView(qlinkPositions, i, function()
+				return qlinkPositions[i]
+			end) / 127
 		end,
 		SetValue = function(v)
 			record("SetValue", i, v)
-			qlinkPositions[i] = math.max(0, math.min(127, math.floor((tonumber(v) or 0) * 127 + 0.5)))
-			qlinkValueStrings[i] = qlinkPercent(qlinkPositions[i])
+			local np = math.max(0, math.min(127, math.floor((tonumber(v) or 0) * 127 + 0.5)))
+			lagStage(qlinkPositions, i, function()
+				return qlinkPositions[i]
+			end, np)
+			qlinkPositions[i] = np
+			lagStage(qlinkValueStrings, i, function()
+				return qlinkValueStrings[i]
+			end, qlinkPercent(np))
+			qlinkValueStrings[i] = qlinkPercent(np)
 		end,
 		GetValueString = function()
 			record("GetValueString")
-			return qlinkValueStrings[i]
+			-- explicitly unassigned slots answer with an empty string (device
+			-- behaviour unknown but plausible; this is what exercises the
+			-- script's never-blank "-" fallback)
+			if qlinkTargets[i] == false then
+				return ""
+			end
+			return lagView(qlinkValueStrings, i, function()
+				return qlinkValueStrings[i]
+			end)
 		end,
 		GetTargetName = function()
 			-- false marks an explicitly unassigned Q-Link (returns nil)
@@ -407,16 +675,34 @@ M.setQlinkTarget = function(i, name)
 	qlinkTargets[i] = name
 end
 M.setTimeDivision = function(v)
+	lagStage(scalarLag, "division", getDivisionRaw, v)
 	mockDivision = v
 end
 M.setSwingStale = function(v)
 	SWING_STALE = v and true or false
+end
+-- Test fixture (task T2): flip the swing wire form to 0..1 fractions (the H3
+-- hypothesis the script auto-detects). lagReseed drops pending swing writes so
+-- the flip cannot leak a percent-form value into the fraction world.
+M.setSwingFraction = function(v)
+	SWING_IS_FRACTION = v and true or false
+	lagReseed()
 end
 M.setTwistNoEffect = function(v)
 	twistNoEffect = v and true or false
 end
 M.qlinkPosition = function(i)
 	return qlinkPositions[i]
+end
+
+-- Test fixture (task T2): replace the automation-filter enum (nil restores the
+-- default 4-value cycle). filterIndex restarts at the first entry and the lag
+-- model is re-synced, so a pending filter write cannot leak into the new list.
+function M.setFilterTypes(list)
+	FILTER_TYPES = (list ~= nil and #list > 0) and list or { "Off", "Latch", "Touch", "Write" }
+	filterIndex = 1
+	project.GlobalAutomationFilterType:set(FILTER_TYPES[1])
+	lagReseed()
 end
 
 local function button(name)
@@ -514,40 +800,45 @@ local function scriptMappings()
 end
 
 local function qlinkMappings()
-	-- Device-inferred (H4) argument order: the QLINK INDEX comes first, then
-	-- the CC, then an optional channel. Keyed per qlink+cc so the script's
-	-- query-flip self-verification gets a truthful counterpart: a legacy
-	-- channel-first bind lands under the wrong key and the (qlink, cc) query
-	-- fails it, instead of confirming the mis-bind like the old mock did.
-	local key = function(qi, cc)
-		return tostring(qi) .. ":" .. tostring(cc)
+	-- Akai's shipped signatures (mpc310 kit scripts, mpkMiniMkIV.lua): bindings
+	-- are keyed per (channel, cc) -- AddInfiniteCCToQLink(channel, cc, qlinkIndex),
+	-- RemoveInfiniteCCToQLink(channel, cc), IsQLinkMappedInfinite(channel, cc),
+	-- SetQLinkFineAdjust(fine). A channel-first bind lands under the wrong key
+	-- and the honest (channel, cc) query fails it, so the script's query-flip
+	-- verification cannot confirm a mis-bind. The stored value is the Q-Link
+	-- index, so tests can assert the QLINK_ORDER slot a knob was bound to.
+	local key = function(ch, cc)
+		return tostring(ch) .. ":" .. tostring(cc)
 	end
-	local CH_ANALOG = 15 -- the script's analog channel (faders + encoders)
 	return {
-		AddInfiniteCCToQLink = function(qi, cc, ch)
-			record("AddInfiniteCCToQLink", qi, cc, ch)
-			M.qlinkMapped[key(qi, cc)] = ch or CH_ANALOG
+		AddInfiniteCCToQLink = function(ch, cc, qi)
+			record("AddInfiniteCCToQLink", ch, cc, qi)
+			if M.nativeMappingHostile then
+				return -- accepts anything, stores nothing: the mis-bind case
+			end
+			M.qlinkMapped[key(ch, cc)] = qi
 		end,
-		RemoveInfiniteCCToQLink = function(qi, cc, ch)
-			record("RemoveInfiniteCCToQLink", qi, cc, ch)
-			M.qlinkMapped[key(qi, cc)] = nil
+		RemoveInfiniteCCToQLink = function(ch, cc)
+			record("RemoveInfiniteCCToQLink", ch, cc)
+			M.qlinkMapped[key(ch, cc)] = nil
 		end,
-		IsQLinkMappedInfinite = function(qi, cc)
-			return M.qlinkMapped[key(qi, cc)] ~= nil
+		IsQLinkMappedInfinite = function(ch, cc)
+			record("IsQLinkMappedInfinite", ch, cc)
+			return M.qlinkMapped[key(ch, cc)] ~= nil
 		end,
-		AddAbsoluteCCToQLink = function(qi, cc, ch)
-			record("AddAbsoluteCCToQLink", qi, cc, ch)
+		AddAbsoluteCCToQLink = function(ch, cc, qi)
+			record("AddAbsoluteCCToQLink", ch, cc, qi)
 		end,
-		SetInfiniteCCMagnitude = function(qi, cc, mag)
-			record("SetInfiniteCCMagnitude", qi, cc, mag)
+		-- Call recorder only: the signature is unprobed and the honest script
+		-- never calls it (test-native-routing.lua asserts the count stays 0).
+		SetInfiniteCCMagnitude = function(...)
+			record("SetInfiniteCCMagnitude", ...)
 		end,
-		SetQLinkFineAdjust = function(qi, cc, fine)
-			record("SetQLinkFineAdjust", qi, cc, fine)
+		SetQLinkFineAdjust = function(fine)
+			record("SetQLinkFineAdjust", fine)
 		end,
 	}
 end
-
-local now = 0
 
 M.dev = {
 	mappings = {

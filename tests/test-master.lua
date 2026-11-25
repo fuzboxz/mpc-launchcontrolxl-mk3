@@ -57,16 +57,25 @@ assert_eq(countLogs("master volume write failed"), 0, "silent dead slot logs not
 assert_eq(countLogs("master volume read failed"), 0, "dead slot read succeeds, so no read log")
 
 -- (2) read-only fixture: the write raises -> exactly one log, then logOnce
--- suppresses the second turn's line.
+-- suppresses the second turn's line. The quiet gap makes the stepper re-read
+-- the device (the shadow only lives for STEP_QUIET ticks).
 mock.setMasterSlot("readonly")
+for _ = 1, 8 do
+	L.HandleTimer()
+end
 turnMaster(1)
 assert_eq(countLogs("master volume write failed"), 1, "read-only master logs one write failure")
 turnMaster(1)
 assert_eq(countLogs("master volume write failed"), 1, "second turn does not log again (logOnce)")
 
 -- (3) nil-read fixture: Volume cannot be read -> one read log, and no write is
--- even attempted (the write failure count must not grow).
+-- even attempted (the write failure count must not grow). The quiet gap first
+-- is what sends the stepper back to the read path (a fresh shadow would
+-- legitimately step without any read).
 mock.setMasterSlot("nilread")
+for _ = 1, 8 do
+	L.HandleTimer()
+end
 turnMaster(1)
 assert_eq(countLogs("master volume read failed"), 1, "unreadable master logs one read failure")
 assert_eq(countLogs("master volume write failed"), 1, "no blind write attempted on an unreadable slot")
@@ -75,6 +84,9 @@ assert_eq(countLogs("master volume write failed"), 1, "no blind write attempted 
 -- fixture above is a slot property, not a broken handler.
 mock.makeMasterLive()
 mock.mpc.tracks.masterTracks[0].Volume:set(0.5)
+for _ = 1, 8 do
+	L.HandleTimer()
+end
 turnMaster(1)
 assert_eq(mock.mpc.tracks.masterTracks[0].Volume.value > 0.5, true, "live master slot moves on a turn")
 

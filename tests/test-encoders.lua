@@ -69,14 +69,14 @@ L.HandleMIDICC(15, 85, 65)
 assert_near(mock.tracks[0].Send4.value, 1 / 64, 0.0001, "bank B row 2 nudges Send 4")
 
 -- Control mode: the device reports mode 2. Native Q-Link routing ships OFF
--- (fw 1.1.11 direction inversion): the rel CCs stay script-owned and rows 1-2
--- drive the Q-Links through the script-side Twist fallback.
+-- (pending the direction probe, __LCXL3_NATIVE): the rel CCs stay script-owned
+-- and rows 1-2 drive the Q-Links through the script-side Twist fallback.
 mock.reset()
 L.HandleMIDICC(6, 30, 2)
 assert_eq(mock.count("AddInfiniteCCToQLink"), 0, "native routing disabled by default")
 assert_eq(mock.dev.mappings.script.IsCCMappedToScript(15, 77), true, "rel CCs stay script-owned")
-mock.setQlinkTarget(12, "Cutoff") -- row 1 col 1 = index 12 (screen order)
-L.HandleMIDICC(15, 77, 66) -- +2 on row 1 col 1 (Q-Link index 12)
+mock.setQlinkTarget(12, "Cutoff") -- row 1 k1 (cc 77) = index 12 (screen order)
+L.HandleMIDICC(15, 77, 66) -- +2 on row 1 k1 (Q-Link index 12)
 L.HandleTimer()
 assert_eq(mock.count("Twist"), 1, "the fallback drives the Q-Link through dot-form Twist")
 assert_near(mock.tracks[0].Send3.value, 1 / 64, 0.0001, "script-owned CCs never touch the mixer")
@@ -118,8 +118,8 @@ mock.dev.mappings.controlSurface = nil
 L.HandleMIDICC(6, 30, 2) -- enter control mode without any mapping API
 mock.clearCalls()
 assert_eq(mock.count("Twist"), 0, "no Twist before any movement")
-mock.setQlinkTarget(4, "Drive") -- row 1 col 3 = group 1 third = Q-Link 5 (index 4)
-L.HandleMIDICC(15, 79, 65) -- +1 on row 1 col 3 -> Q-Link 3
+mock.setQlinkTarget(4, "Drive") -- row 1 k3 (cc 79) = Q-Link 5 (index 4)
+L.HandleMIDICC(15, 79, 65) -- +1 on row 1 k3 -> Q-Link 5
 L.HandleTimer()
 assert_eq(mock.count("Twist"), 1, "no Twist-callable fallback still drives via the same path")
 for _ = 1, 40 do -- 2 texts/tick pacing: drain the queue plus its re-asserts

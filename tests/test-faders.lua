@@ -51,6 +51,15 @@ assert_near(mock.tracks[0].Volume.value, 1.0, 0.0001, "fader at the top = full v
 L.HandleMIDICC(15, 5, 0)
 assert_near(mock.tracks[0].Volume.value, 0.0, 0.0001, "fader at the bottom = zero volume")
 
+-- Picked-up tracking (T3): an engaged fader is never re-referenced by the idle
+-- resync (resyncFaders) — the user owns it until the next arm. Full contract in
+-- tests/test-fader-pickup-resync.lua.
+mock.clearCalls()
+mock.tracks[0].Volume:set(0.9)
+mock.runTicks(L, 40)
+assert_eq(sentCC(15, 5, 114), false, "engaged fader not re-referenced by the idle resync")
+mock.tracks[0].Volume:set(0.0) -- restore the state the fader writes left below
+
 -- Bank move: the same fader now owns track 1, pickup re-arms and the device is
 -- told where the new track's volume is.
 mock.tracks[1].Volume:set(0.5)

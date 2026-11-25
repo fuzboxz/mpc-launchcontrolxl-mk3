@@ -99,8 +99,8 @@ assert_eq(mock.leds[13], "0,0,0", "empty-string Q-Link 1 dark too")
 for i = 0, 15 do
 	mock.setQlinkTarget(i, false)
 end
-mock.setQlinkTarget(12, "Cutoff") -- row 1 col 1 = index 12 (MPC screen order)
-mock.setQlinkTarget(14, "Resonance") -- row 2 col 1 = group 3 top (index 14)
+mock.setQlinkTarget(12, "Cutoff") -- knob row 1 k1 = index 12 (MPC screen order)
+mock.setQlinkTarget(14, "Resonance") -- knob row 2 k1 = index 14
 mock.qlinkPositions[12] = 127 -- full turquoise
 mock.qlinkPositions[14] = 64 -- scaled purple
 mock.tracks[0].Solo:set(false) -- any state change marks a repaint
